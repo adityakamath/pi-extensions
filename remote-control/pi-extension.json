@@ -1,14 +1,22 @@
 {
   "name": "remote-control",
-  "description": "Cross-machine session/peer orchestration daemon and control socket for Pi agents.",
+  "description": "Cross-machine peer orchestration and TCP daemon control for Pi agents.",
   "entry": "index.ts",
   "daemon": {
     "script": "daemon.js",
     "tcpPort": 7433,
     "controlSocket": "~/.pi/remote-control/daemon.sock"
   },
-  "tools": ["list_remotes", "send_to_remote"],
-  "commands": ["remote"],
+  "tools": [
+    "add_peer",
+    "remove_peer",
+    "list_peers",
+    "send_to_peer",
+    "list_tailscale",
+    "/tcp-daemon-start",
+    "/tcp-daemon-end"
+  ],
   "author": "Aditya Kamath",
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
+
