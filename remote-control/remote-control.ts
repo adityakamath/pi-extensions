@@ -787,7 +787,7 @@ async function handleCommand(
 const TCP_CONTROL_PORT = 14582; // Well-known port for tailscale/mesh discovery
 
 // Fork: create both Unix socket and TCP listening by default
-async function createServer(pi: ExtensionAPI, state: SocketState, socketPath: string): Promise<net.Server> {
+async function createServer(pi: ExtensionAPI, state: SocketState, socketPath: string): Promise<net.Server | null> {
 	const handler = (socket: net.Socket) => {
 		socket.setEncoding("utf8");
 		let buffer = "";
@@ -819,21 +819,52 @@ async function createServer(pi: ExtensionAPI, state: SocketState, socketPath: st
 		});
 	};
 
-	// Listen on Unix socket as before
+	// Check if socketPath already exists and is alive
+	const alreadyAlive = await isSocketAlive(socketPath);
+	if (alreadyAlive) {
+		console.log(`[pi-remote-server] Control socket already alive at ${socketPath}, not starting new server.`);
+		return null; // Do not throw or crash!
+	}
+
+	// Remove stale socket if present
+	await removeSocket(socketPath);
+
+	// Try to start UNIX socket server
 	const server = net.createServer(handler);
-	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
+
+	const listenPromise = new Promise<void>((resolve, reject) => {
+		server.once("error", err => {
+			if (isErrnoException(err) && err.code === "EADDRINUSE") {
+				console.warn(`[pi-remote-server] Address in use (${socketPath}). Another server is already running. Not fatal.`);
+				resolve(); // Soft-fail: just resolve.
+			} else {
+				reject(err);
+			}
+		});
 		server.listen(socketPath, () => {
 			server.removeListener("error", reject);
 			resolve();
 		});
 	});
+	await listenPromise;
 
-	// Also start TCP server for Tailscale network
+	// TCP tailscale listener as before
 	const tcpServer = net.createServer(handler);
-	tcpServer.listen(TCP_CONTROL_PORT, '0.0.0.0', () => {
-		console.log(`[pi-remote-server] Listening for remote-control on TCP port ${TCP_CONTROL_PORT}`);
+	tcpServer.on('error', err => {
+		if (isErrnoException(err) && err.code === "EADDRINUSE") {
+			// Suppress EADDRINUSE: another process is already handling TCP.
+			// Do not print stack, do not throw, do not display an error.
+			return;
+		}
+		// You may want to log or handle other errors if needed.
 	});
+	try {
+		tcpServer.listen(TCP_CONTROL_PORT, '0.0.0.0', () => {
+			console.log(`[pi-remote-server] Listening for remote-control on TCP port ${TCP_CONTROL_PORT}`);
+		});
+	} catch (_) {
+		// Do NOT throw or print; if port is busy, just skip: client mode will work fine.
+	}
 	// We don't track/close this here—let it live for the session.
 
 	return server;
@@ -1054,7 +1085,7 @@ async function sendRpcCommand(
 	});
 }
 
-async function startControlServer(pi: ExtensionAPI, state: SocketState, ctx: ExtensionContext): Promise<void> {
+async function startControlServer(pi: ExtensionAPI, state: SocketState & { isClientOnly?: boolean }, ctx: ExtensionContext): Promise<void> {
 	await ensureControlDir();
 	const sessionId = ctx.sessionManager.getSessionId();
 	const socketPath = getSocketPath(sessionId);
@@ -1066,14 +1097,25 @@ async function startControlServer(pi: ExtensionAPI, state: SocketState, ctx: Ext
 	}
 
 	await stopControlServer(state);
-	await removeSocket(socketPath);
+
+	const alreadyAlive = await isSocketAlive(socketPath);
+	if (alreadyAlive) {
+		console.log(`[pi-remote-server] Port/socket already in use; switching to client mode (sharing remote-control server for this device).`);
+		state.socketPath = socketPath;
+		state.context = ctx;
+		state.isClientOnly = true;
+		await syncAlias(state, ctx);
+		return; // Client mode: don't start new server
+	}
 
 	state.context = ctx;
 	state.socketPath = socketPath;
-	state.server = await createServer(pi, state, socketPath);
+	state.server = await createServer(pi, state, socketPath); // May return null if already in use
 	state.alias = null;
+	state.isClientOnly = false;
 	await syncAlias(state, ctx);
 }
+
 
 async function stopControlServer(state: SocketState): Promise<void> {
 	if (!state.server) {
