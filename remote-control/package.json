@@ -1,21 +1,20 @@
 {
-  "name": "@adityakamath/pi-remote-control",
+  "name": "pi-remote-control",
   "version": "0.1.0",
-  "description": "Remote session control extension for pi-coding-agent, inspired by Mitsuhiko's control extension.",
-  "main": "remote-control.ts",
-  "types": "remote-control.ts",
+  "description": "Cross-machine session and peer orchestration extension for Pi agents.",
+  "main": "index.ts",
+  "types": "index.ts",
+  "scripts": {
+    "build": "npx esbuild shared.ts --outfile=shared.js --platform=node --format=esm --target=node18 && npx esbuild daemon.ts --outfile=daemon.js --platform=node --format=esm --target=node18",
+    "test": "node demo/test-remote-control.js",
+    "start": "node daemon.js"
+  },
+  "keywords": ["pi", "remote-control", "daemon", "peer", "agent", "session", "extension"],
   "author": "Aditya Kamath",
   "license": "MIT",
-  "keywords": [
-    "pi-extension",
-    "remote-control",
-    "session",
-    "automation"
-  ],
-  "peerDependencies": {
-    "@mariozechner/pi-coding-agent": ">=0.1.0"
-  },
-  "dependencies": {
-    "@adityakamath/pi-remote-control": "^0.1.0"
+  "dependencies": {},
+  "devDependencies": {
+    "esbuild": "^0.19.0",
+    "tsx": "^3.12.7"
   }
 }
