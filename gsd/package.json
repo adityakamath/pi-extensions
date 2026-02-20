@@ -1,0 +1,13 @@
+{
+  "name": "@adityakamath/pi-gsd",
+  "version": "0.1.0",
+  "description": "Get Stuff Done (GSD) extension for pi-coding-agent.",
+  "main": "gsd.ts",
+  "types": "gsd.ts",
+  "author": "Aditya Kamath",
+  "license": "MIT",
+  "keywords": ["pi-extension", "gsd", "productivity"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.1.0"
+  }
+}

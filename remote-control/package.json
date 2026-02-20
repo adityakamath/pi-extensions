@@ -1,0 +1,21 @@
+{
+  "name": "@adityakamath/pi-remote-control",
+  "version": "0.1.0",
+  "description": "Remote session control extension for pi-coding-agent, inspired by Mitsuhiko's control extension.",
+  "main": "remote-control.ts",
+  "types": "remote-control.ts",
+  "author": "Aditya Kamath",
+  "license": "MIT",
+  "keywords": [
+    "pi-extension",
+    "remote-control",
+    "session",
+    "automation"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.1.0"
+  },
+  "dependencies": {
+    "@adityakamath/pi-remote-control": "^0.1.0"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@adityakamath/pi-superpowers",
+  "version": "0.1.0",
+  "description": "Superpowers extension for pi-coding-agent: injects custom tools, commands, and workflows.",
+  "main": "superpowers.ts",
+  "types": "superpowers.ts",
+  "author": "Aditya Kamath",
+  "license": "MIT",
+  "keywords": ["pi-extension", "superpowers", "tools"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.1.0"
+  }
+}
