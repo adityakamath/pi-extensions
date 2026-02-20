@@ -2,25 +2,28 @@
  * Session Control Extension
  *
  * Enables inter-session communication via Unix domain sockets.  When enabled with
- * the `--remote-control` flag, each pi session creates a control socket at
- * `~/.pi/remote-control/<remote-id>.sock` that accepts JSON-RPC commands.
- * 
- * Here, "remote" refers to a remote session—the interface for connecting to another running pi session.
+ * the `--session-control` flag, each pi session creates a control socket at
+ * `~/.pi/session-control/<session-id>.sock` that accepts JSON-RPC commands.
  *
  * Features:
  * - Send messages to other running pi sessions (steer or follow-up mode)
+ *   via tool (`send_to_session`) or startup CLI flags (`--control-session`, `--send-session-message`)
  * - Retrieve the last assistant message from a session
  * - Get AI-generated summaries of session activity
  * - Clear/rewind sessions to their initial state
  * - Subscribe to turn_end events for async coordination
  *
- * Once loaded the extension registers a `send_to_remote` tool that allows the AI to
- * communicate with other remote pi sessions programmatically.
- *
- * In this extension, "remote" means a "remote session"—that is, another pi agent (even if running locally).
+ * Once loaded the extension registers a `send_to_session` tool that allows the AI to
+ * communicate with other pi sessions programmatically.
  *
  * Usage:
- *   pi --remote-control
+ *   pi --session-control
+ *
+ * One-shot startup send:
+ *   pi -p --session-control --control-session <session-name|session-id> --send-session-message <text>
+ *     [--send-session-mode steer|follow_up] [--send-session-wait turn_end|message_processed]
+ *     [--send-session-include-sender-info]
+ *   (startup send is one-way by default; use --send-session-wait turn_end to capture response on stdout)
  *
  * Environment:
  *   Sets PI_SESSION_ID when enabled, allowing child processes to discover
@@ -45,19 +48,23 @@ import { complete, type Model, type Api, type UserMessage, type TextContent } fr
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Box, Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { exec } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
-
-const execAsync = promisify(exec);
+const exec = promisify(execCb);
 
 const CONTROL_FLAG = "remote-control";
+const CONTROL_TARGET_FLAG = "control-remote";
+const CONTROL_SEND_MESSAGE_FLAG = "send-remote-message";
+const CONTROL_SEND_MODE_FLAG = "send-remote-mode";
+const CONTROL_SEND_WAIT_FLAG = "send-remote-wait";
+const CONTROL_SEND_INCLUDE_SENDER_FLAG = "send-remote-include-sender-info";
 const CONTROL_DIR = path.join(os.homedir(), ".pi", "remote-control");
 const SOCKET_SUFFIX = ".sock";
-const SESSION_MESSAGE_TYPE = "remote-message";
+const SESSION_MESSAGE_TYPE = "session-message";
 const SENDER_INFO_PATTERN = /<sender_info>[\s\S]*?<\/sender_info>/g;
 
 // ============================================================================
@@ -115,19 +122,13 @@ interface RpcSubscribeCommand {
 	id?: string;
 }
 
-interface RpcListRemotesCommand {
-	type: "list_remotes";
-	id?: string;
-}
-
 type RpcCommand =
 	| RpcSendCommand
 	| RpcGetMessageCommand
 	| RpcGetSummaryCommand
 	| RpcClearCommand
 	| RpcAbortCommand
-	| RpcSubscribeCommand
-	| RpcListRemotesCommand;
+	| RpcSubscribeCommand;
 
 // ============================================================================
 // Subscription Management
@@ -191,7 +192,7 @@ async function selectSummarizationModel(
 // Utilities
 // ============================================================================
 
-const STATUS_KEY = "remote-control";
+const STATUS_KEY = "session-control";
 
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
 	return typeof error === "object" && error !== null && "code" in error;
@@ -350,14 +351,55 @@ type LiveSessionInfo = {
 	name?: string;
 	aliases: string[];
 	socketPath: string;
+	host?: string;        // Tailscale or local host
+	isRemote?: boolean;   // Remote or local flag
 };
+
+// Get short Tailscale hostnames of reachable peers
+async function getTailscalePeers(): Promise<string[]> {
+	try {
+		const { stdout } = await exec('tailscale status --json');
+		const status = JSON.parse(stdout);
+		const peers: string[] = [];
+		if (status.Peer) {
+			for (const id in status.Peer) {
+				const p = status.Peer[id];
+				if (p.HostName) {
+					peers.push(p.HostName);
+				}
+			}
+		}
+		return peers;
+	} catch (err) {
+		return [];
+	}
+}
+
+// Probe a peer via 'tailscale ssh <host> ...' for Pi control sockets
+async function getRemoteSocketsViaTailscale(hostname: string): Promise<Array<{sessionId: string, socketPath: string, host: string}>> {
+	try {
+		const { stdout } = await exec(`tailscale ssh ${hostname} 'ls ~/.pi/remote-control/*.sock 2>/dev/null || true'`);
+		const lines = stdout.split("\n").map(s => s.trim()).filter(Boolean);
+		return lines.map(line => {
+			const sockName = path.basename(line);
+			return {
+				sessionId: sockName.replace(SOCKET_SUFFIX, ""),
+				socketPath: line,
+				host: hostname,
+			};
+		});
+	} catch {
+		return [];
+	}
+}
 
 async function getLiveSessions(): Promise<LiveSessionInfo[]> {
 	await ensureControlDir();
+
+	// Local sessions
 	const entries = await fs.readdir(CONTROL_DIR, { withFileTypes: true });
 	const aliasMap = await getAliasMap();
 	const sessions: LiveSessionInfo[] = [];
-
 	for (const entry of entries) {
 		if (!entry.name.endsWith(SOCKET_SUFFIX)) continue;
 		const socketPath = path.join(CONTROL_DIR, entry.name);
@@ -367,11 +409,32 @@ async function getLiveSessions(): Promise<LiveSessionInfo[]> {
 		if (!isSafeSessionId(sessionId)) continue;
 		const aliases = aliasMap.get(socketPath) ?? [];
 		const name = aliases[0];
-		sessions.push({ sessionId, name, aliases, socketPath });
+		sessions.push({ sessionId, name, aliases, socketPath, host: os.hostname(), isRemote: false });
 	}
 
-	sessions.sort((a, b) => (a.name ?? a.sessionId).localeCompare(b.name ?? b.sessionId));
-	return sessions;
+	// Tailscale remote sessions
+	let peerSessions: LiveSessionInfo[] = [];
+	try {
+		const peers = await getTailscalePeers();
+		await Promise.all(peers.map(async (peer) => {
+			// Avoid querying self
+			if (peer === os.hostname()) return;
+			const remotes = await getRemoteSocketsViaTailscale(peer);
+			for (const r of remotes) {
+				peerSessions.push({
+					sessionId: r.sessionId,
+					name: undefined,
+					aliases: [],
+					socketPath: r.socketPath,
+					host: r.host,
+					isRemote: true
+				});
+			}
+		}));
+	} catch {}
+	const allSessions = sessions.concat(peerSessions);
+	allSessions.sort((a, b) => (a.name ?? a.sessionId).localeCompare(b.name ?? b.sessionId));
+	return allSessions;
 }
 
 async function syncAlias(state: SocketState, ctx: ExtensionContext): Promise<void> {
@@ -554,7 +617,7 @@ function formatSenderInfo(info: SenderInfo | null): string | null {
 	return null;
 }
 
-const renderRemoteMessage: MessageRenderer = (message, { expanded }, theme) => {
+const renderSessionMessage: MessageRenderer = (message, { expanded }, theme) => {
 	const rawContent = extractTextContent(message.content);
 	const senderInfo = parseSenderInfo(rawContent);
 	let text = stripSenderInfo(rawContent);
@@ -766,29 +829,15 @@ async function handleCommand(
 		return;
 	}
 
-	// List sessions
-	if (command.type === "list_remotes") {
-		try {
-			const sessions = await getLiveSessions();
-			respond(true, "list_sessions", { sessions });
-		} catch (error) {
-			respond(false, "list_sessions", undefined, error instanceof Error ? error.message : "Failed to list sessions");
-		}
-		return;
-	}
-
 	respond(false, command.type, undefined, `Unsupported command: ${command.type}`);
 }
 
 // ============================================================================
-// Server Management & Tailscale TCP Integration
+// Server Management
 // ============================================================================
 
-const TCP_CONTROL_PORT = 14582; // Well-known port for tailscale/mesh discovery
-
-// Fork: create both Unix socket and TCP listening by default
-async function createServer(pi: ExtensionAPI, state: SocketState, socketPath: string): Promise<net.Server | null> {
-	const handler = (socket: net.Socket) => {
+async function createServer(pi: ExtensionAPI, state: SocketState, socketPath: string): Promise<net.Server> {
+	const server = net.createServer((socket) => {
 		socket.setEncoding("utf8");
 		let buffer = "";
 		socket.on("data", (chunk) => {
@@ -817,107 +866,18 @@ async function createServer(pi: ExtensionAPI, state: SocketState, socketPath: st
 				handleCommand(pi, state, parsed.command!, socket);
 			}
 		});
-	};
+	});
 
-	// Check if socketPath already exists and is alive
-	const alreadyAlive = await isSocketAlive(socketPath);
-	if (alreadyAlive) {
-		console.log(`[pi-remote-server] Control socket already alive at ${socketPath}, not starting new server.`);
-		return null; // Do not throw or crash!
-	}
-
-	// Remove stale socket if present
-	await removeSocket(socketPath);
-
-	// Try to start UNIX socket server
-	const server = net.createServer(handler);
-
-	const listenPromise = new Promise<void>((resolve, reject) => {
-		server.once("error", err => {
-			if (isErrnoException(err) && err.code === "EADDRINUSE") {
-				console.warn(`[pi-remote-server] Address in use (${socketPath}). Another server is already running. Not fatal.`);
-				resolve(); // Soft-fail: just resolve.
-			} else {
-				reject(err);
-			}
-		});
+	// Wait for server to start listening, with error handling
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
 		server.listen(socketPath, () => {
 			server.removeListener("error", reject);
 			resolve();
 		});
 	});
-	await listenPromise;
-
-	// TCP tailscale listener as before
-	const tcpServer = net.createServer(handler);
-	tcpServer.on('error', err => {
-		if (isErrnoException(err) && err.code === "EADDRINUSE") {
-			// Suppress EADDRINUSE: another process is already handling TCP.
-			// Do not print stack, do not throw, do not display an error.
-			return;
-		}
-		// You may want to log or handle other errors if needed.
-	});
-	try {
-		tcpServer.listen(TCP_CONTROL_PORT, '0.0.0.0', () => {
-			console.log(`[pi-remote-server] Listening for remote-control on TCP port ${TCP_CONTROL_PORT}`);
-		});
-	} catch (_) {
-		// Do NOT throw or print; if port is busy, just skip: client mode will work fine.
-	}
-	// We don't track/close this here—let it live for the session.
 
 	return server;
-}
-
-// Tailscale peer discovery for live pi sessions w/ remote-control
-async function listTailscaleRemotes(): Promise<{ sessionId: string, username: string, hostname: string, ip: string }[]> {
-	const { execSync } = await import('node:child_process');
-	const netMod = await import('node:net');
-	const osMod = await import('node:os');
-	const PEER_QUERY_TIMEOUT = 1200;
-	let peers: { TailscaleIPs: string[], HostName: string, Hostinfo?: { User?: string } }[] = [];
-
-	try {
-		const out = execSync('tailscale status --json', { encoding: 'utf-8' });
-		const status = JSON.parse(out);
-		peers = Object.values(status.Peer || {});
-	} catch (e) {
-		return [];
-	}
-
-	// Probe each peer on TCP_CONTROL_PORT and only return those running pi remote-control
-	const probes = peers.map((peer: any) => {
-		const ip = peer.TailscaleIPs?.[0];
-		if (!ip) return Promise.resolve(null);
-		return new Promise<{ sessionId: string, username: string, hostname: string, ip: string } | null>(resolve => {
-			const sock = new netMod.Socket();
-			let settled = false;
-			sock.setTimeout(PEER_QUERY_TIMEOUT);
-			sock.connect(TCP_CONTROL_PORT, ip, () => {
-				sock.write(JSON.stringify({ type: "get_message" }) + "\n");
-			});
-			sock.on('data', d => {
-				let data;
-				try { data = JSON.parse(d.toString()); } catch { resolve(null); sock.destroy(); return; }
-				if (data && data.type === 'response') {
-					const si = (data.data && data.data.message) || {};
-					resolve({
-						sessionId: si.sessionId || '',
-						username: si.username || peer.Hostinfo?.User || '',
-						hostname: si.hostname || peer.HostName || '',
-						ip
-					});
-					sock.destroy();
-				}
-			});
-			sock.on('error', () => { if (!settled) { settled = true; resolve(null); } });
-			sock.on('timeout', () => { if (!settled) { settled = true; resolve(null); } });
-			sock.on('close', () => { if (!settled) { settled = true; resolve(null); } });
-		});
-	});
-	const probeResults = await Promise.all(probes);
-	return probeResults.filter(Boolean) as { sessionId: string, username: string, hostname: string, ip: string }[];
 }
 
 interface RpcClientOptions {
@@ -925,87 +885,12 @@ interface RpcClientOptions {
 	waitForEvent?: "turn_end";
 }
 
-async function sendRemoteRpcCommand(
-	remoteHost: string,
+async function sendRpcCommand(
 	socketPath: string,
 	command: RpcCommand,
 	options: RpcClientOptions = {},
 ): Promise<{ response: RpcResponse; event?: { message?: ExtractedMessage; turnIndex?: number } }> {
 	const { timeout = 5000, waitForEvent } = options;
-
-	// Build the local JS script to run on the remote side
-	// This script will connect to the local socket and handle the RPC
-	const script = `
-const net = require('net');
-const socket = net.createConnection('${socketPath}');
-socket.setEncoding('utf8');
-
-const timeout = setTimeout(() => {
-	console.error('timeout');
-	process.exit(1);
-}, ${timeout + 2000});
-
-let buffer = '';
-let response = null;
-
-socket.on('connect', () => {
-	socket.write(JSON.stringify(${JSON.stringify(command)}) + '\\n');
-	if ('${waitForEvent}' === 'turn_end') {
-		socket.write(JSON.stringify({ type: 'subscribe', event: 'turn_end' }) + '\\n');
-	}
-});
-
-socket.on('data', (chunk) => {
-	buffer += chunk;
-	let newlineIndex = buffer.indexOf('\\n');
-	while (newlineIndex !== -1) {
-		const line = buffer.slice(0, newlineIndex).trim();
-		buffer = buffer.slice(newlineIndex + 1);
-		newlineIndex = buffer.indexOf('\\n');
-		if (!line) continue;
-
-		try {
-			const msg = JSON.parse(line);
-			if (msg.type === 'response') {
-				if (msg.command === '${command.type}') {
-					response = msg;
-					if (!'${waitForEvent}') {
-						console.log(JSON.stringify({ response }));
-						process.exit(0);
-					}
-				}
-			} else if (msg.type === 'event' && msg.event === 'turn_end' && '${waitForEvent}' === 'turn_end') {
-				console.log(JSON.stringify({ response, event: msg.data || {} }));
-				process.exit(0);
-			}
-		} catch (e) {}
-	}
-});
-
-socket.on('error', (err) => {
-	console.error(err.message);
-	process.exit(1);
-});
-`;
-
-	try {
-		const { stdout } = await execAsync(`ssh ${remoteHost} "node -e ${JSON.stringify(script)}"`);
-		return JSON.parse(stdout.trim());
-	} catch (error) {
-		throw new Error(`Remote RPC failed: ${error instanceof Error ? error.message : String(error)}`);
-	}
-}
-
-async function sendRpcCommand(
-	socketPath: string,
-	command: RpcCommand,
-	options: RpcClientOptions & { remoteHost?: string } = {},
-): Promise<{ response: RpcResponse; event?: { message?: ExtractedMessage; turnIndex?: number } }> {
-	const { timeout = 5000, waitForEvent, remoteHost } = options;
-
-	if (remoteHost) {
-		return await sendRemoteRpcCommand(remoteHost, socketPath, command, options);
-	}
 
 	return new Promise((resolve, reject) => {
 		const socket = net.createConnection(socketPath);
@@ -1085,7 +970,7 @@ async function sendRpcCommand(
 	});
 }
 
-async function startControlServer(pi: ExtensionAPI, state: SocketState & { isClientOnly?: boolean }, ctx: ExtensionContext): Promise<void> {
+async function startControlServer(pi: ExtensionAPI, state: SocketState, ctx: ExtensionContext): Promise<void> {
 	await ensureControlDir();
 	const sessionId = ctx.sessionManager.getSessionId();
 	const socketPath = getSocketPath(sessionId);
@@ -1097,25 +982,14 @@ async function startControlServer(pi: ExtensionAPI, state: SocketState & { isCli
 	}
 
 	await stopControlServer(state);
-
-	const alreadyAlive = await isSocketAlive(socketPath);
-	if (alreadyAlive) {
-		console.log(`[pi-remote-server] Port/socket already in use; switching to client mode (sharing remote-control server for this device).`);
-		state.socketPath = socketPath;
-		state.context = ctx;
-		state.isClientOnly = true;
-		await syncAlias(state, ctx);
-		return; // Client mode: don't start new server
-	}
+	await removeSocket(socketPath);
 
 	state.context = ctx;
 	state.socketPath = socketPath;
-	state.server = await createServer(pi, state, socketPath); // May return null if already in use
+	state.server = await createServer(pi, state, socketPath);
 	state.alias = null;
-	state.isClientOnly = false;
 	await syncAlias(state, ctx);
 }
-
 
 async function stopControlServer(state: SocketState): Promise<void> {
 	if (!state.server) {
@@ -1161,9 +1035,32 @@ function updateSessionEnv(ctx: ExtensionContext | null, enabled: boolean): void 
 
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag(CONTROL_FLAG, {
-		description: "Enable per-remote control socket under ~/.pi/remote-control",
+		description: "Enable per-session control socket under ~/.pi/session-control",
 		type: "boolean",
 	});
+	pi.registerFlag(CONTROL_TARGET_FLAG, {
+		description: "Target session name or session id for startup control send",
+		type: "string",
+	});
+	pi.registerFlag(CONTROL_SEND_MESSAGE_FLAG, {
+		description: "Message to send to --control-session at startup",
+		type: "string",
+	});
+	pi.registerFlag(CONTROL_SEND_MODE_FLAG, {
+		description: "Startup send mode: steer or follow_up",
+		type: "string",
+		default: "steer",
+	});
+	pi.registerFlag(CONTROL_SEND_WAIT_FLAG, {
+		description: "Startup send wait mode: turn_end or message_processed",
+		type: "string",
+	});
+	pi.registerFlag(CONTROL_SEND_INCLUDE_SENDER_FLAG, {
+		description: "Include <sender_info> in startup messages (advanced; default: false)",
+		type: "boolean",
+	});
+
+	let cliSendHandled = false;
 
 	const state: SocketState = {
 		server: null,
@@ -1174,11 +1071,11 @@ export default function (pi: ExtensionAPI) {
 		turnEndSubscriptions: [],
 	};
 
-	pi.registerMessageRenderer(SESSION_MESSAGE_TYPE, renderRemoteMessage);
+	pi.registerMessageRenderer(SESSION_MESSAGE_TYPE, renderSessionMessage);
 
-	registerRemoteTool(pi, state);
-	registerListRemotesTool(pi);
-	registerControlRemotesCommand(pi);
+	registerSessionTool(pi, state);
+	registerListSessionsTool(pi);
+	registerControlSessionsCommand(pi);
 
 	const refreshServer = async (ctx: ExtensionContext) => {
 		const enabled = pi.getFlag(CONTROL_FLAG) === true;
@@ -1205,6 +1102,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await refreshServer(ctx);
+		if (!cliSendHandled) {
+			cliSendHandled = true;
+			await maybeHandleStartupControlSend(pi, ctx);
+		}
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
@@ -1245,10 +1146,10 @@ export default function (pi: ExtensionAPI) {
 }
 
 // ============================================================================
-// Tool: send_to_remote
+// Tool: send_to_session
 // ============================================================================
 
-function registerRemoteTool(pi: ExtensionAPI, state: SocketState): void {
+function registerSessionTool(pi: ExtensionAPI, state: SocketState): void {
 	pi.registerTool({
 		name: "send_to_remote",
 		label: "Send To Session",
@@ -1268,13 +1169,30 @@ Wait behavior (only for action=send):
 - wait_until=turn_end: Wait for the turn to complete, returns last assistant message.
 - wait_until=message_processed: Returns immediately after message is queued.
 
+CLI bridge (for shell scripts/background jobs):
+- Current session id is available in shell/bash as $PI_SESSION_ID (set when --session-control is enabled).
+- Use $PI_SESSION_ID when you need the current session; do not call list_sessions just to discover your own id.
+- Target session must be running with --session-control.
+- One-shot startup send is available via extension flags:
+  --session-control
+  --control-session <session-name|session-id>
+  --send-session-message <text>
+  --send-session-mode <steer|follow_up> (optional, default: steer)
+  --send-session-wait <turn_end|message_processed> (optional)
+  --send-session-include-sender-info (optional, advanced; default: off)
+- Startup sends are one-way by default (no sender_info), which avoids reply attempts to short-lived 'pi -p' sender sessions.
+- If a script needs a response, use --send-session-wait turn_end and read stdout.
+- Example script usage (one-way):
+  pi -p --session-control --control-session "$PI_SESSION_ID" --send-session-message "Background task finished" --send-session-mode follow_up --send-session-wait message_processed
+- Example request/response usage:
+  pi -p --session-control --control-session "$PI_SESSION_ID" --send-session-message "What is the current time?" --send-session-wait turn_end
+
 Note: If you ask the target session to reply back via sender_info, do not use wait_until; waiting is redundant and can duplicate responses.
 
-Messages automatically include sender session info for replies. When you want a response, instruct the target session to reply directly to the sender by calling send_to_remote with the sender_info reference (do not poll get_message).`,
+Messages automatically include sender session info for replies. When you want a response, instruct the target session to reply directly to the sender by calling send_to_session with the sender_info reference (do not poll get_message).`,
 		parameters: Type.Object({
 			sessionId: Type.Optional(Type.String({ description: "Target session id (UUID)" })),
 			sessionName: Type.Optional(Type.String({ description: "Target session name (alias)" })),
-			remoteHost: Type.Optional(Type.String({ description: "Remote host to connect via SSH (e.g. user@host)" })),
 			action: Type.Optional(
 				StringEnum(["send", "get_message", "get_summary", "clear"] as const, {
 					description: "Action to perform (default: send)",
@@ -1294,34 +1212,15 @@ Messages automatically include sender session info for replies. When you want a 
 				}),
 			),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			const action = params.action ?? "send";
 			const sessionName = params.sessionName?.trim();
 			const sessionId = params.sessionId?.trim();
-			const remoteHost = params.remoteHost?.trim();
 			let targetSessionId: string | null = null;
-			const displayTarget = (remoteHost ? `${remoteHost}:` : "") + (sessionName || sessionId || "");
+			const displayTarget = sessionName || sessionId || "";
 
 			if (sessionName) {
-				if (remoteHost) {
-					// For remote hosts, we can't easily resolve aliases without a remote call
-					// Let's implement a quick check for remote aliases
-					try {
-						const result = await sendRpcCommand("", { type: "list_sessions" }, { remoteHost });
-						const sessions = result.response.data?.sessions as LiveSessionInfo[];
-						const session = sessions.find(s => s.aliases.includes(sessionName) || s.name === sessionName);
-						if (session) {
-							targetSessionId = session.sessionId;
-						}
-					} catch (e) {
-						return {
-							content: [{ type: "text", text: `Failed to resolve remote session name: ${e instanceof Error ? e.message : String(e)}` }],
-							isError: true,
-						};
-					}
-				} else {
-					targetSessionId = await resolveSessionIdFromAlias(sessionName);
-				}
+				targetSessionId = await resolveSessionIdFromAlias(sessionName);
 				if (!targetSessionId) {
 					return {
 						content: [{ type: "text", text: "Unknown session name" }],
@@ -1359,12 +1258,11 @@ Messages automatically include sender session info for replies. When you want a 
 
 			const socketPath = getSocketPath(targetSessionId);
 			const senderSessionId = state.context?.sessionManager.getSessionId();
-			const rpcOptions = { remoteHost };
 
 			try {
 				// Handle each action
 				if (action === "get_message") {
-					const result = await sendRpcCommand(socketPath, { type: "get_message" }, rpcOptions);
+					const result = await sendRpcCommand(socketPath, { type: "get_message" });
 					if (!result.response.success) {
 						return {
 							content: [{ type: "text", text: `Failed: ${result.response.error ?? "unknown error"}` }],
@@ -1386,7 +1284,7 @@ Messages automatically include sender session info for replies. When you want a 
 				}
 
 				if (action === "get_summary") {
-					const result = await sendRpcCommand(socketPath, { type: "get_summary" }, { ...rpcOptions, timeout: 60000 });
+					const result = await sendRpcCommand(socketPath, { type: "get_summary" }, { timeout: 60000 });
 					if (!result.response.success) {
 						return {
 							content: [{ type: "text", text: `Failed: ${result.response.error ?? "unknown error"}` }],
@@ -1408,7 +1306,7 @@ Messages automatically include sender session info for replies. When you want a 
 				}
 
 				if (action === "clear") {
-					const result = await sendRpcCommand(socketPath, { type: "clear", summarize: false }, { ...rpcOptions, timeout: 10000 });
+					const result = await sendRpcCommand(socketPath, { type: "clear", summarize: false }, { timeout: 10000 });
 					if (!result.response.success) {
 						return {
 							content: [{ type: "text", text: `Failed to clear: ${result.response.error ?? "unknown error"}` }],
@@ -1438,7 +1336,6 @@ Messages automatically include sender session info for replies. When you want a 
 					? `\n\n<sender_info>${JSON.stringify({
 						sessionId: senderSessionId,
 						sessionName: senderSessionName || undefined,
-						hostname: os.hostname(),
 					})}</sender_info>`
 					: "";
 
@@ -1451,7 +1348,7 @@ Messages automatically include sender session info for replies. When you want a 
 				// Determine wait behavior
 				if (params.wait_until === "message_processed") {
 					// Just send and confirm delivery
-					const result = await sendRpcCommand(socketPath, sendCommand, rpcOptions);
+					const result = await sendRpcCommand(socketPath, sendCommand);
 					if (!result.response.success) {
 						return {
 							content: [{ type: "text", text: `Failed: ${result.response.error ?? "unknown error"}` }],
@@ -1468,7 +1365,6 @@ Messages automatically include sender session info for replies. When you want a 
 				if (params.wait_until === "turn_end") {
 					// Send and wait for turn to complete
 					const result = await sendRpcCommand(socketPath, sendCommand, {
-						...rpcOptions,
 						timeout: 300000, // 5 minutes
 						waitForEvent: "turn_end",
 					});
@@ -1522,14 +1418,10 @@ Messages automatically include sender session info for replies. When you want a 
 		renderCall(args, theme) {
 			const action = args.action ?? "send";
 			const sessionRef = args.sessionName ?? args.sessionId ?? "...";
-			const remoteHost = args.remoteHost;
 			const shortSessionRef = sessionRef.length > 12 ? sessionRef.slice(0, 8) + "..." : sessionRef;
 
 			// Build the header line
 			let header = theme.fg("toolTitle", theme.bold("→ session "));
-			if (remoteHost) {
-				header += theme.fg("accent", `${remoteHost}:`);
-			}
 			header += theme.fg("accent", shortSessionRef);
 
 			// Add action-specific info
@@ -1661,72 +1553,222 @@ Messages automatically include sender session info for replies. When you want a 
 }
 
 // ============================================================================
-// Tool: list_remotes
+// Tool: list_sessions
 // ============================================================================
 
-function registerListRemotesTool(pi: ExtensionAPI): void {
+function registerListSessionsTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "list_remotes",
 		label: "List Sessions",
-		description: "List live sessions that expose a control socket on this machine or current Tailscale tailnet. Only peers running pi with --remote-control are included.",
-		parameters: Type.Object({
-			remoteHost: Type.Optional(Type.String({ description: "Remote host to list sessions from (ssh). If omitted, scans local and tailnet." })),
-		}),
-		async execute(toolCallId, params) {
-			const remoteHost = params.remoteHost?.trim();
-			let sessions: LiveSessionInfo[] = [];
-			let tailscaleSessions: { sessionId: string, username: string, hostname: string, ip: string }[] = [];
+		description: "List live sessions that expose a control socket (optionally with session names). Use this for discovery only; for the current session id in shell/bash use $PI_SESSION_ID.",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+			const sessions = await getLiveSessions();
 
-			try {
-				if (remoteHost) {
-					const result = await sendRpcCommand("", { type: "list_sessions" }, { remoteHost });
-					sessions = result.response.data?.sessions as LiveSessionInfo[] ?? [];
-				} else {
-					sessions = await getLiveSessions();
-					tailscaleSessions = await listTailscaleRemotes();
-				}
-			} catch (error) {
+			if (sessions.length === 0) {
 				return {
-					content: [{ type: "text", text: `Failed to list sessions: ${error instanceof Error ? error.message : String(error)}` }],
-					isError: true,
-				};
-			}
-
-			if (sessions.length === 0 && tailscaleSessions.length === 0) {
-				return {
-					content: [{ type: "text", text: `No live sessions found${remoteHost ? ` on ${remoteHost}` : ""}.` }],
+					content: [{ type: "text", text: "No live sessions found." }],
 					details: { sessions: [] },
 				};
 			}
 
-			const localLines = sessions.length
-				? ["Local sessions:", ...sessions.map((session) => {
-					const name = session.name ? ` (${session.name})` : "";
-					return `- ${session.sessionId}${name}`;
-				})]
-				: [];
-
-			const tailnetLines = tailscaleSessions.length
-				? ["Tailscale peer sessions:", ...tailscaleSessions.map(s => {
-					return `- ${s.sessionId || ''} @ ${s.username || s.hostname || s.ip} (${s.ip})`;
-				})]
-				: [];
+			const lines = sessions.map((session) => {
+				const name = session.name ? ` (${session.name})` : "";
+				const hostStr = session.isRemote ? ` [remote: ${session.host}]` : " [local]";
+				return `- ${session.sessionId}${name}${hostStr}`;
+			});
 
 			return {
-				content: [{ type: "text", text: [...localLines, ...tailnetLines].join("\n") }],
-				details: { sessions, tailscaleSessions },
+				content: [{ type: "text", text: `Live sessions:\n${lines.join("\n")}` }],
+				details: { sessions },
 			};
 		},
 	});
 }
 
-function registerControlRemotesCommand(pi: ExtensionAPI): void {
+type StartupControlSendOptions = {
+	target: string;
+	message: string;
+	mode: "steer" | "follow_up";
+	waitUntil?: "turn_end" | "message_processed";
+	includeSenderInfo: boolean;
+};
+
+function normalizeMode(raw: string): "steer" | "follow_up" | null {
+	const value = raw.trim().toLowerCase();
+	if (value === "steer") return "steer";
+	if (value === "follow_up" || value === "follow-up" || value === "followup") return "follow_up";
+	return null;
+}
+
+function normalizeWaitUntil(raw: string): "turn_end" | "message_processed" | null {
+	const value = raw.trim().toLowerCase();
+	if (value === "turn_end" || value === "turn-end") return "turn_end";
+	if (value === "message_processed" || value === "message-processed") return "message_processed";
+	return null;
+}
+
+function getStringFlag(pi: ExtensionAPI, name: string): string | undefined {
+	const value = pi.getFlag(name);
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function parseStartupControlSendOptions(pi: ExtensionAPI): { options?: StartupControlSendOptions; error?: string } {
+	const target = getStringFlag(pi, CONTROL_TARGET_FLAG);
+	const message = getStringFlag(pi, CONTROL_SEND_MESSAGE_FLAG);
+
+	if (!target && !message) {
+		return {};
+	}
+	if (target && !message) {
+		return { error: `Missing --${CONTROL_SEND_MESSAGE_FLAG} (required with --${CONTROL_TARGET_FLAG})` };
+	}
+	if (!target && message) {
+		return { error: `Missing --${CONTROL_TARGET_FLAG} (required with --${CONTROL_SEND_MESSAGE_FLAG})` };
+	}
+
+	const rawMode = getStringFlag(pi, CONTROL_SEND_MODE_FLAG) ?? "steer";
+	const mode = normalizeMode(rawMode);
+	if (!mode) {
+		return { error: `Invalid --${CONTROL_SEND_MODE_FLAG}: ${rawMode}. Use steer|follow_up.` };
+	}
+
+	const rawWait = getStringFlag(pi, CONTROL_SEND_WAIT_FLAG);
+	let waitUntil: "turn_end" | "message_processed" | undefined;
+	if (rawWait) {
+		const normalized = normalizeWaitUntil(rawWait);
+		if (!normalized) {
+			return {
+				error: `Invalid --${CONTROL_SEND_WAIT_FLAG}: ${rawWait}. Use turn_end|message_processed.`,
+			};
+		}
+		waitUntil = normalized;
+	}
+
+	const includeSenderInfo = pi.getFlag(CONTROL_SEND_INCLUDE_SENDER_FLAG) === true;
+
+	return {
+		options: {
+			target: target!,
+			message: message!,
+			mode,
+			waitUntil,
+			includeSenderInfo,
+		},
+	};
+}
+
+function reportStartupControlSend(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info"): void {
+	if (ctx.hasUI) {
+		ctx.ui.notify(message, level);
+		return;
+	}
+	if (level === "error") {
+		console.error(message);
+		return;
+	}
+	console.log(message);
+}
+
+async function maybeHandleStartupControlSend(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+	const parsed = parseStartupControlSendOptions(pi);
+	if (!parsed.options) {
+		if (parsed.error) {
+			reportStartupControlSend(ctx, parsed.error, "error");
+		}
+		return;
+	}
+
+	const { target, message, mode, waitUntil, includeSenderInfo } = parsed.options;
+	let targetSessionId = await resolveSessionIdFromAlias(target);
+	if (!targetSessionId && isSafeSessionId(target)) {
+		targetSessionId = target;
+	}
+
+	if (!targetSessionId) {
+		reportStartupControlSend(ctx, `Unknown target session: ${target}`, "error");
+		return;
+	}
+
+	const socketPath = getSocketPath(targetSessionId);
+	const alive = await isSocketAlive(socketPath);
+	if (!alive) {
+		reportStartupControlSend(ctx, `Target session not reachable: ${target}`, "error");
+		return;
+	}
+
+	const senderInfo = includeSenderInfo
+		? (() => {
+			const senderSessionId = ctx.sessionManager.getSessionId();
+			const senderSessionName = ctx.sessionManager.getSessionName()?.trim();
+			return senderSessionId
+				? `\n\n<sender_info>${JSON.stringify({
+					sessionId: senderSessionId,
+					sessionName: senderSessionName || undefined,
+				})}</sender_info>`
+				: "";
+		})()
+		: "";
+
+	const sendCommand: RpcSendCommand = {
+		type: "send",
+		message: message + senderInfo,
+		mode,
+	};
+
+	try {
+		if (waitUntil === "turn_end") {
+			const result = await sendRpcCommand(socketPath, sendCommand, {
+				timeout: 300000,
+				waitForEvent: "turn_end",
+			});
+			if (!result.response.success) {
+				reportStartupControlSend(ctx, `Failed to send: ${result.response.error ?? "unknown error"}`, "error");
+				return;
+			}
+			const lastMessage = result.event?.message;
+			if (!lastMessage?.content) {
+				reportStartupControlSend(ctx, `Message delivered to ${target}; turn completed without assistant output.`);
+				return;
+			}
+			if (ctx.hasUI) {
+				pi.sendMessage(
+					{
+						customType: "control-send",
+						content: `Startup response from ${target}:\n\n${lastMessage.content}`,
+						display: true,
+					},
+					{ triggerTurn: false },
+				);
+			} else {
+				console.log(lastMessage.content);
+			}
+			return;
+		}
+
+		const result = await sendRpcCommand(socketPath, sendCommand, { timeout: 30000 });
+		if (!result.response.success) {
+			reportStartupControlSend(ctx, `Failed to send: ${result.response.error ?? "unknown error"}`, "error");
+			return;
+		}
+
+		const waitLabel = waitUntil === "message_processed" ? " (message processed)" : "";
+		reportStartupControlSend(ctx, `Message sent to ${target}${waitLabel}`);
+	} catch (error) {
+		const msg = error instanceof Error ? error.message : "unknown error";
+		reportStartupControlSend(ctx, `Failed to send to ${target}: ${msg}`, "error");
+	}
+}
+
+function registerControlSessionsCommand(pi: ExtensionAPI): void {
 	pi.registerCommand("control-remotes", {
-		description: "List controllable remotes (from remote-control sockets)",
+		description: "List controllable sessions (from session-control sockets)",
 		handler: async (_args, ctx) => {
 			if (pi.getFlag(CONTROL_FLAG) !== true) {
 				if (ctx.hasUI) {
-					ctx.ui.notify("Remote control not enabled (use --remote-control)", "warning");
+					ctx.ui.notify("Session control not enabled (use --session-control)", "warning");
 				}
 				return;
 			}
