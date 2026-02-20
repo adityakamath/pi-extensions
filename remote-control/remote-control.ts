@@ -781,11 +781,14 @@ async function handleCommand(
 }
 
 // ============================================================================
-// Server Management
+// Server Management & Tailscale TCP Integration
 // ============================================================================
 
+const TCP_CONTROL_PORT = 14582; // Well-known port for tailscale/mesh discovery
+
+// Fork: create both Unix socket and TCP listening by default
 async function createServer(pi: ExtensionAPI, state: SocketState, socketPath: string): Promise<net.Server> {
-	const server = net.createServer((socket) => {
+	const handler = (socket: net.Socket) => {
 		socket.setEncoding("utf8");
 		let buffer = "";
 		socket.on("data", (chunk) => {
@@ -814,9 +817,10 @@ async function createServer(pi: ExtensionAPI, state: SocketState, socketPath: st
 				handleCommand(pi, state, parsed.command!, socket);
 			}
 		});
-	});
+	};
 
-	// Wait for server to start listening, with error handling
+	// Listen on Unix socket as before
+	const server = net.createServer(handler);
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
 		server.listen(socketPath, () => {
@@ -825,7 +829,64 @@ async function createServer(pi: ExtensionAPI, state: SocketState, socketPath: st
 		});
 	});
 
+	// Also start TCP server for Tailscale network
+	const tcpServer = net.createServer(handler);
+	tcpServer.listen(TCP_CONTROL_PORT, '0.0.0.0', () => {
+		console.log(`[pi-remote-server] Listening for remote-control on TCP port ${TCP_CONTROL_PORT}`);
+	});
+	// We don't track/close this here—let it live for the session.
+
 	return server;
+}
+
+// Tailscale peer discovery for live pi sessions w/ remote-control
+async function listTailscaleRemotes(): Promise<{ sessionId: string, username: string, hostname: string, ip: string }[]> {
+	const { execSync } = await import('node:child_process');
+	const netMod = await import('node:net');
+	const osMod = await import('node:os');
+	const PEER_QUERY_TIMEOUT = 1200;
+	let peers: { TailscaleIPs: string[], HostName: string, Hostinfo?: { User?: string } }[] = [];
+
+	try {
+		const out = execSync('tailscale status --json', { encoding: 'utf-8' });
+		const status = JSON.parse(out);
+		peers = Object.values(status.Peer || {});
+	} catch (e) {
+		return [];
+	}
+
+	// Probe each peer on TCP_CONTROL_PORT and only return those running pi remote-control
+	const probes = peers.map((peer: any) => {
+		const ip = peer.TailscaleIPs?.[0];
+		if (!ip) return Promise.resolve(null);
+		return new Promise<{ sessionId: string, username: string, hostname: string, ip: string } | null>(resolve => {
+			const sock = new netMod.Socket();
+			let settled = false;
+			sock.setTimeout(PEER_QUERY_TIMEOUT);
+			sock.connect(TCP_CONTROL_PORT, ip, () => {
+				sock.write(JSON.stringify({ type: "get_message" }) + "\n");
+			});
+			sock.on('data', d => {
+				let data;
+				try { data = JSON.parse(d.toString()); } catch { resolve(null); sock.destroy(); return; }
+				if (data && data.type === 'response') {
+					const si = (data.data && data.data.message) || {};
+					resolve({
+						sessionId: si.sessionId || '',
+						username: si.username || peer.Hostinfo?.User || '',
+						hostname: si.hostname || peer.HostName || '',
+						ip
+					});
+					sock.destroy();
+				}
+			});
+			sock.on('error', () => { if (!settled) { settled = true; resolve(null); } });
+			sock.on('timeout', () => { if (!settled) { settled = true; resolve(null); } });
+			sock.on('close', () => { if (!settled) { settled = true; resolve(null); } });
+		});
+	});
+	const probeResults = await Promise.all(probes);
+	return probeResults.filter(Boolean) as { sessionId: string, username: string, hostname: string, ip: string }[];
 }
 
 interface RpcClientOptions {
@@ -1565,20 +1626,22 @@ function registerListRemotesTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "list_remotes",
 		label: "List Sessions",
-		description: "List live sessions that expose a control socket (optionally with session names).",
+		description: "List live sessions that expose a control socket on this machine or current Tailscale tailnet. Only peers running pi with --remote-control are included.",
 		parameters: Type.Object({
-			remoteHost: Type.Optional(Type.String({ description: "Remote host to list sessions from" })),
+			remoteHost: Type.Optional(Type.String({ description: "Remote host to list sessions from (ssh). If omitted, scans local and tailnet." })),
 		}),
 		async execute(toolCallId, params) {
 			const remoteHost = params.remoteHost?.trim();
-			let sessions: LiveSessionInfo[];
+			let sessions: LiveSessionInfo[] = [];
+			let tailscaleSessions: { sessionId: string, username: string, hostname: string, ip: string }[] = [];
 
 			try {
 				if (remoteHost) {
 					const result = await sendRpcCommand("", { type: "list_sessions" }, { remoteHost });
-					sessions = result.response.data?.sessions as LiveSessionInfo[];
+					sessions = result.response.data?.sessions as LiveSessionInfo[] ?? [];
 				} else {
 					sessions = await getLiveSessions();
+					tailscaleSessions = await listTailscaleRemotes();
 				}
 			} catch (error) {
 				return {
@@ -1587,21 +1650,29 @@ function registerListRemotesTool(pi: ExtensionAPI): void {
 				};
 			}
 
-			if (sessions.length === 0) {
+			if (sessions.length === 0 && tailscaleSessions.length === 0) {
 				return {
 					content: [{ type: "text", text: `No live sessions found${remoteHost ? ` on ${remoteHost}` : ""}.` }],
 					details: { sessions: [] },
 				};
 			}
 
-			const lines = sessions.map((session) => {
-				const name = session.name ? ` (${session.name})` : "";
-				return `- ${session.sessionId}${name}`;
-			});
+			const localLines = sessions.length
+				? ["Local sessions:", ...sessions.map((session) => {
+					const name = session.name ? ` (${session.name})` : "";
+					return `- ${session.sessionId}${name}`;
+				})]
+				: [];
+
+			const tailnetLines = tailscaleSessions.length
+				? ["Tailscale peer sessions:", ...tailscaleSessions.map(s => {
+					return `- ${s.sessionId || ''} @ ${s.username || s.hostname || s.ip} (${s.ip})`;
+				})]
+				: [];
 
 			return {
-				content: [{ type: "text", text: `Live sessions${remoteHost ? ` on ${remoteHost}` : ""}:\n${lines.join("\n")}` }],
-				details: { sessions },
+				content: [{ type: "text", text: [...localLines, ...tailnetLines].join("\n") }],
+				details: { sessions, tailscaleSessions },
 			};
 		},
 	});
