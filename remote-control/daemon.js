@@ -38,9 +38,11 @@ let tcpServer = null;
 let daemonServer = null;
 let fsWatcher = null;
 function resetAutoShutdown() {
-  if (autoShutdownTimer) clearTimeout(autoShutdownTimer);
+  if (autoShutdownTimer)
+    clearTimeout(autoShutdownTimer);
   const timeoutMs = config.autoShutdownTimeout * 1e3;
-  if (timeoutMs <= 0) return;
+  if (timeoutMs <= 0)
+    return;
   autoShutdownTimer = setTimeout(() => {
     const noLocal = localSessions.size === 0;
     const noPeers = remotePeers.size === 0 || [...remotePeers.values()].every((p) => !p.connected);
@@ -56,8 +58,10 @@ function resetAutoShutdown() {
 }
 function cleanup() {
   log("Cleaning up...");
-  if (heartbeatTimer) clearInterval(heartbeatTimer);
-  if (autoShutdownTimer) clearTimeout(autoShutdownTimer);
+  if (heartbeatTimer)
+    clearInterval(heartbeatTimer);
+  if (autoShutdownTimer)
+    clearTimeout(autoShutdownTimer);
   if (fsWatcher) {
     try {
       fsWatcher.close();
@@ -65,7 +69,8 @@ function cleanup() {
     }
   }
   for (const peer of remotePeers.values()) {
-    if (peer.reconnectTimer) clearTimeout(peer.reconnectTimer);
+    if (peer.reconnectTimer)
+      clearTimeout(peer.reconnectTimer);
     if (peer.socket) {
       try {
         peer.socket.destroy();
@@ -159,8 +164,10 @@ async function verifySocketAlive(socketPath, timeoutMs = 300) {
 async function addLocalSession(sockFile) {
   const base = path.basename(sockFile, SOCKET_SUFFIX);
   const sessionId = base;
-  if (!isSafeSessionId(sessionId)) return;
-  if (localSessions.has(sessionId)) return;
+  if (!isSafeSessionId(sessionId))
+    return;
+  if (localSessions.has(sessionId))
+    return;
   const socketPath = path.join(CONTROL_DIR, sockFile);
   const alive = await verifySocketAlive(socketPath);
   if (!alive) {
@@ -183,7 +190,8 @@ async function addLocalSession(sockFile) {
 }
 function removeLocalSession(sessionId) {
   const entry = localSessions.get(sessionId);
-  if (!entry) return;
+  if (!entry)
+    return;
   localSessions.delete(sessionId);
   removeSessionName(sessionId);
   log(`Local session removed: ${sessionId}`);
@@ -206,9 +214,12 @@ async function scanLocalSessions() {
 function startFsWatch() {
   try {
     fsWatcher = fs.watch(CONTROL_DIR, async (eventType, filename) => {
-      if (!filename) return;
-      if (!filename.endsWith(SOCKET_SUFFIX)) return;
-      if (filename === path.basename(DAEMON_SOCK)) return;
+      if (!filename)
+        return;
+      if (!filename.endsWith(SOCKET_SUFFIX))
+        return;
+      if (filename === path.basename(DAEMON_SOCK))
+        return;
       const sockFile = filename;
       const socketPath = path.join(CONTROL_DIR, sockFile);
       const sessionId = path.basename(sockFile, SOCKET_SUFFIX);
@@ -364,7 +375,8 @@ function setupPeerSocket(peer, socket) {
     buffer = lines.pop() ?? "";
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed) continue;
+      if (!trimmed)
+        continue;
       try {
         const msg = JSON.parse(trimmed);
         if (msg.type === "hello" && !peer.connected) {
@@ -404,7 +416,8 @@ function setupPeerSocket(peer, socket) {
   });
 }
 function scheduleReconnect(peer) {
-  if (peer.removed) return;
+  if (peer.removed)
+    return;
   const delay = Math.min(1e3 * Math.pow(2, peer.reconnectAttempts), 6e4);
   peer.reconnectAttempts++;
   log(`Reconnecting to ${peer.host}:${peer.port} in ${delay}ms (attempt ${peer.reconnectAttempts}).`);
@@ -450,7 +463,8 @@ function startHeartbeat() {
     const heartbeatMsg = JSON.stringify({ type: "heartbeat" }) + "\n";
     const now = Date.now();
     for (const peer of remotePeers.values()) {
-      if (!peer.connected || !peer.socket) continue;
+      if (!peer.connected || !peer.socket)
+        continue;
       if (now - peer.lastSeen > deadThreshold) {
         log(`Peer ${peer.host} timed out (no message for ${deadThreshold}ms). Closing.`);
         peer.socket.destroy();
@@ -499,7 +513,8 @@ async function relayToLocalSocket(socketPath, rpcCommand, timeoutMs) {
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed) continue;
+        if (!trimmed)
+          continue;
         if (!done) {
           done = true;
           clearTimeout(timer);
@@ -761,7 +776,8 @@ function startDaemonServer() {
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed) continue;
+        if (!trimmed)
+          continue;
         try {
           const req = JSON.parse(trimmed);
           handleDaemonCommand(socket, req).catch((err) => {
@@ -804,7 +820,8 @@ function startTcpServer() {
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed) continue;
+        if (!trimmed)
+          continue;
         try {
           const msg = JSON.parse(trimmed);
           if (!helloDone) {

@@ -1108,205 +1108,6 @@ async function sendViaRelay(
   return { response: relayData?.response ?? { type: "response", command: rpcCommand.type, success: true } };
 }
 
-// ============================================================================
-// /remote command
-// ============================================================================
-
-function registerRemoteCommand(pi: ExtensionAPI, state: SocketState): void {
-  pi.registerCommand("remote", {
-    description: "Manage remote peer connections and sessions",
-    getArgumentCompletions: (_partial: string) => ["add", "remove", "list", "list-tailscale", "kill-daemon"],
-    handler: async (args: string[], ctx: ExtensionContext) => {
-  try {
-    const subcommandRaw = args[0];
-    const subcommand = typeof subcommandRaw === "string" ? subcommandRaw.trim() : "";
-
-    // Defensive: empty or undefined
-    if (!subcommand) {
-      // Show status/help as before
-      const ok = await ensureDaemon(ctx);
-      if (!ok) {
-        ctx.hasUI && ctx.ui.notify("❌ Daemon could not be started. Check logs and build daemon.js.", "error");
-        return;
-      }
-      try {
-        const resp = await sendDaemonCommand({ type: "status" }, 5000);
-        if (!resp.success) {
-          ctx.hasUI && ctx.ui.notify(`❌ Daemon error: ${resp.error ?? "unknown"}`, "error");
-          return;
-        }
-        // Defensive: never pass undefined to rendering
-        const data = resp.data || {};
-        const lines: string[] = [
-          `**Daemon Status**`,
-          `- PID: ${data.pid ?? "?"}`,
-          `- Uptime: ${data.uptime ?? 0}s`,
-          `- Port: ${data.port ?? "?"}`,
-          `- Local sessions: ${data.localSessionCount ?? 0}`,
-          `- Connected peers: ${data.remotePeerCount ?? 0}`,
-        ];
-        if (Array.isArray(data.peers) && data.peers.length > 0) {
-          lines.push(`\n**Peers:**`);
-          for (const peer of data.peers) {
-            const status = peer.connected ? "🟢 connected" : "🔴 disconnected";
-            lines.push(`- ${peer.host ?? "unknown"}:${peer.port ?? "?"} — ${status} (${peer.sessionCount ?? 0} sessions)`);
-          }
-        }
-        pi.sendMessage(
-          { customType: "remote-status", content: lines.join("\n"), display: true },
-          { triggerTurn: false },
-        );
-      } catch (err) {
-        ctx.hasUI && ctx.ui.notify(`❌ Failed to get daemon status: ${err instanceof Error ? err.message : String(err)}`, "error");
-      }
-      return;
-    }
-
-    const validSubcommands = ["add", "remove", "list", "list-tailscale", "kill-daemon"];
-    if (!validSubcommands.includes(subcommand)) {
-      ctx.hasUI && ctx.ui.notify(
-        `❌ Unknown subcommand: ${subcommand}. Use: add, remove, list, list-tailscale, kill-daemon`,
-        "error"
-      );
-      return;
-    }
-
-    if (["add", "remove"].includes(subcommand)) {
-      const hostRaw = args[1];
-      const host = typeof hostRaw === "string" ? hostRaw.trim() : "";
-      if (!host) {
-        ctx.hasUI && ctx.ui.notify(`❌ Usage: /remote ${subcommand} <host>`, "error");
-        return;
-      }
-    }
-
-    // ADD
-    if (subcommand === "add") {
-      const host = typeof args[1] === "string" ? args[1].trim() : "";
-      try {
-        const ok = await ensureDaemon(ctx);
-        if (!ok) return;
-        const resp = await sendDaemonCommand({ type: "add_peer", host }, 15000);
-        if (resp.success) {
-          ctx.hasUI && ctx.ui.notify(`🌐 Connected to peer: ${host}`, "info");
-        } else {
-          ctx.hasUI && ctx.ui.notify(`❌ Failed to connect to ${host}: ${resp.error ?? "unknown"}`, "error");
-        }
-      } catch (err) {
-        ctx.hasUI && ctx.ui.notify(
-          `❌ Connection refused to ${host} — is the daemon running on that machine?`,
-          "error"
-        );
-      }
-      return;
-    }
-
-    // REMOVE
-    if (subcommand === "remove") {
-      const host = typeof args[1] === "string" ? args[1].trim() : "";
-      try {
-        const resp = await sendDaemonCommand({ type: "remove_peer", host }, 5000);
-        if (resp.success) {
-          ctx.hasUI && ctx.ui.notify(`Removed peer: ${host}`, "info");
-        } else {
-          ctx.hasUI && ctx.ui.notify(`❌ ${resp.error ?? "Failed to remove peer"}`, "error");
-        }
-      } catch (err) {
-        ctx.hasUI && ctx.ui.notify(
-          `❌ Failed to remove peer: ${err instanceof Error ? err.message : String(err)}`,
-          "error"
-        );
-      }
-      return;
-    }
-
-    // LIST
-    if (subcommand === "list") {
-      try {
-        const resp = await sendDaemonCommand({ type: "list_sessions" }, 5000);
-        if (!resp.success) {
-          ctx.hasUI && ctx.ui.notify(`❌ ${resp.error ?? "Failed to list sessions"}`, "error");
-          return;
-        }
-        const data = resp.data as { sessions?: Array<SessionInfo & { host?: string; isRemote?: boolean }> };
-        const sessions = Array.isArray(data.sessions) ? data.sessions : [];
-        const lines = sessions.length === 0
-          ? ["No sessions found."]
-          : sessions.map((s) => {
-              const sessionId = typeof s.sessionId === "string" ? s.sessionId : "(unknown)";
-              const nameStr = s.name && typeof s.name === "string" ? ` (${s.name})` : "";
-              const hostStr =
-                s.isRemote && typeof s.host === "string"
-                  ? ` [remote: ${s.host}]`
-                  : (s.isRemote ? " [remote]" : " [local]");
-              return `- ${sessionId}${nameStr}${hostStr}`;
-            });
-        pi.sendMessage(
-          { customType: "remote-list", content: `**Sessions:**\n${lines.join("\n")}`, display: true },
-          { triggerTurn: false },
-        );
-      } catch (err) {
-        ctx.hasUI && ctx.ui.notify(
-          `❌ Failed to list sessions: ${err instanceof Error ? err.message : String(err)}`,
-          "error"
-        );
-      }
-      return;
-    }
-
-    // LIST-TAILSCALE
-    if (subcommand === "list-tailscale") {
-      try {
-        const ok = await ensureDaemon(ctx);
-        if (!ok) return;
-        const resp = await sendDaemonCommand({ type: "list_tailscale" }, 10000);
-        if (!resp.success) {
-          ctx.hasUI && ctx.ui.notify(`⚠️ Tailscale unavailable: ${resp.error ?? "unknown"}`, "warning");
-          return;
-        }
-        const data = resp.data as { peers?: string[] };
-        const peers = Array.isArray(data.peers) ? data.peers : [];
-        const content = peers.length === 0
-          ? "No Tailscale peers found."
-          : `**Tailscale peers:**\n${peers.map((p) => `- ${p}`).join("\n")}`;
-        pi.sendMessage(
-          { customType: "remote-tailscale", content, display: true },
-          { triggerTurn: false },
-        );
-      } catch (err) {
-        ctx.hasUI && ctx.ui.notify(
-          `❌ Failed to list Tailscale peers: ${err instanceof Error ? err.message : String(err)}`,
-          "error"
-        );
-      }
-      return;
-    }
-
-    // KILL-DAEMON
-    if (subcommand === "kill-daemon") {
-      if (!fs.existsSync(DAEMON_SOCK)) {
-        ctx.hasUI && ctx.ui.notify("Daemon is not running", "info");
-        return;
-      }
-      try {
-        await sendDaemonCommand({ type: "kill" }, 5000);
-        ctx.hasUI && ctx.ui.notify("Daemon stopped", "info");
-      } catch {
-        ctx.hasUI && ctx.ui.notify("Daemon stopped", "info");
-      }
-      return;
-    }
-  } catch (err) {
-    // Catch-all: defensive fallback
-    ctx.hasUI && ctx.ui.notify(
-      `❌ An unexpected error occurred: ${err instanceof Error ? err.message : String(err)}`,
-      "error"
-    );
-  }
-}
-
-  });
-}
 
 // ============================================================================
 // Tool: list_remotes
@@ -1841,9 +1642,44 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerMessageRenderer(SESSION_MESSAGE_TYPE, renderSessionMessage);
 
-  registerRemoteCommand(pi, state);
   registerListRemotesTool(pi, state);
   registerSendToRemoteTool(pi, state);
+
+  // Register /tcp-daemon-start command
+  pi.registerCommand("tcp-daemon-start", {
+    description: "Start the remote control daemon (background process)",
+    handler: async (_args, ctx) => {
+      if (fs.existsSync(DAEMON_SOCK)) {
+        ctx.hasUI && ctx.ui.notify("Daemon already running", "info");
+        return;
+      }
+      ctx.hasUI && ctx.ui.notify("Starting daemon...", "info");
+      const started = await spawnDaemon();
+      if (!started) {
+        ctx.hasUI && ctx.ui.notify("❌ Daemon failed to start", "error");
+      } else {
+        ctx.hasUI && ctx.ui.notify("✅ Daemon started", "success");
+      }
+    }
+  });
+
+  // Register /tcp-daemon-end command
+  pi.registerCommand("tcp-daemon-end", {
+    description: "Stop the remote control daemon (background process)",
+    handler: async (_args, ctx) => {
+      if (!fs.existsSync(DAEMON_SOCK)) {
+        ctx.hasUI && ctx.ui.notify("Daemon is not running", "info");
+        return;
+      }
+      ctx.hasUI && ctx.ui.notify("Stopping daemon...", "info");
+      try {
+        await sendDaemonCommand({ type: "kill" }, 5000);
+        ctx.hasUI && ctx.ui.notify("✅ Daemon stopped", "success");
+      } catch {
+        ctx.hasUI && ctx.ui.notify("✅ Daemon stopped", "success");
+      }
+    }
+  });
 
   const refreshServer = async (ctx: ExtensionContext) => {
     try {

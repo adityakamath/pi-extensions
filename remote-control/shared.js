@@ -18,7 +18,8 @@ const DEFAULT_CONFIG = {
 };
 function loadConfig() {
   try {
-    if (!fs.existsSync(CONFIG_FILE)) return { config: { ...DEFAULT_CONFIG } };
+    if (!fs.existsSync(CONFIG_FILE))
+      return { config: { ...DEFAULT_CONFIG } };
     const raw = fs.readFileSync(CONFIG_FILE, "utf8");
     const parsed = JSON.parse(raw);
     return {
@@ -256,7 +257,8 @@ function generateWhimsicalName() {
   return `${adj}-${noun}`;
 }
 function getSessionName(sessionId) {
-  if (!isSafeSessionId(sessionId)) return null;
+  if (!isSafeSessionId(sessionId))
+    return null;
   try {
     const filePath = path.join(NAMES_DIR, sessionId);
     return fs.readFileSync(filePath, "utf8").trim();
@@ -265,14 +267,16 @@ function getSessionName(sessionId) {
   }
 }
 function setSessionName(sessionId, name) {
-  if (!isSafeSessionId(sessionId)) return;
+  if (!isSafeSessionId(sessionId))
+    return;
   ensureControlDir();
   fs.mkdirSync(NAMES_DIR, { recursive: true });
   const filePath = path.join(NAMES_DIR, sessionId);
   fs.writeFileSync(filePath, name, "utf8");
 }
 function removeSessionName(sessionId) {
-  if (!isSafeSessionId(sessionId)) return;
+  if (!isSafeSessionId(sessionId))
+    return;
   try {
     const filePath = path.join(NAMES_DIR, sessionId);
     fs.unlinkSync(filePath);
@@ -284,7 +288,8 @@ function ensureControlDir() {
 }
 function isDaemonRunning() {
   const pid = getDaemonPid();
-  if (pid === null) return false;
+  if (pid === null)
+    return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -302,10 +307,14 @@ function getDaemonPid() {
   }
 }
 function isSafeSessionId(sessionId) {
-  if (!sessionId || sessionId.length === 0) return false;
-  if (sessionId.includes("/")) return false;
-  if (sessionId.includes("\\")) return false;
-  if (sessionId.includes("..")) return false;
+  if (!sessionId || sessionId.length === 0)
+    return false;
+  if (sessionId.includes("/"))
+    return false;
+  if (sessionId.includes("\\"))
+    return false;
+  if (sessionId.includes(".."))
+    return false;
   return true;
 }
 export {

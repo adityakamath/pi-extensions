@@ -1,0 +1,46 @@
+# .gitignore for pi-extensions
+# Node modules
+node_modules/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build output
+dist/
+build/
+
+# Dependency directories
+/.pnp/
+.pnp.js
+
+# Misc
+.DS_Store
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE/editor directories
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+# pi agent cache
+.pi/
+
+# Test coverage
+coverage/
+
+# Temporary files
+~*
+*.swp
+*.tmp
+
+# Ignore extension binaries
+*.bin
