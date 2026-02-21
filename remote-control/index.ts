@@ -438,10 +438,22 @@ const renderSessionMessage: MessageRenderer = (message, { expanded }, theme) => 
 
   const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
   const labelBase = theme.fg("customMessageLabel", `\x1b[1m[${message.customType}]\x1b[22m`);
-  const senderText = formatSenderInfo(senderInfo);
-  const label = senderText
-    ? `${labelBase} ${theme.fg("dim", `from ${senderText}`)}`
-    : labelBase;
+  // ==== OVERRIDE SENDER LABEL LOGIC ====
+  // Use sessionMetaMap if available, get best-known sessionId
+  const fallbackId = (senderInfo && senderInfo.sessionId) || message.sessionId || "<unknown>";
+
+  // locality logic
+  let computedLocality = "[local]";
+  try {
+    const myHost = require("os").hostname();
+    const senderHost = (senderInfo && senderInfo.hostname) || message.hostname || "";
+    if (senderHost && senderHost !== myHost) {
+      computedLocality = `[remote: ${senderHost}]`;
+    }
+  } catch {}
+
+  // [[ Format ]]: [session-message] from <sessionId> [local/remote:host]
+  let label = labelBase + theme.fg("dim", ` from ${fallbackId} ${computedLocality}`);
   box.addChild(new Text(label, 0, 0));
   box.addChild(new Spacer(1));
   box.addChild(
@@ -1836,6 +1848,10 @@ Messages automatically include sender session info for replies. When you want a 
 
       try {
         if (action === "get_message") {
+          if (!(ctx && (ctx as any).explicitGetMessage)) {
+            // This is an automated/background get_message - suppress output
+            return { content: [], details: { suppressed: true } };
+          }
           const result = await sendViaRelay(targetSessionId, { type: "get_message" });
           if (!result.response.success) {
             return {
