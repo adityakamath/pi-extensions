@@ -1078,6 +1078,9 @@ async function sendRpcCommand(
  * The targetSessionId is embedded as sender_info so the message renderer
  * can show who the reply came from.
  */
+// Track last async reply per session (by sessionId)
+const lastInjectedAsyncReply: { [sessionId: string]: { content: string, timestamp?: number } } = {};
+
 function subscribeForAsyncReply(
   pi: ExtensionAPI,
   socketPath: string,
@@ -1117,26 +1120,38 @@ function subscribeForAsyncReply(
             const data = evt.data as { message?: ExtractedMessage } | undefined;
             const lastMessage = data?.message;
             if (lastMessage?.content) {
-              // Tag the reply with the target's identity so the message renderer
-              // shows who replied. The reply content itself may already have
-              // sender_info from the target if they used send_to_session to reply,
-              // but we tag it here as a fallback so it always shows a sender.
-              const alreadyTagged = lastMessage.content.includes("<sender_info>");
-              const tag = alreadyTagged
-                ? ""
-                : `\n\n<sender_info>${JSON.stringify({
-                    sessionId: targetSessionId,
-                    sessionName: targetSessionName || undefined,
-                  })}</sender_info>`;
-              // Inject the reply into the current session as a display-only message
-              pi.sendMessage(
-                {
-                  customType: SESSION_MESSAGE_TYPE,
-                  content: lastMessage.content + tag,
-                  display: true,
-                },
-                { triggerTurn: false },
-              );
+              // Check for duplicate async reply
+              const last = lastInjectedAsyncReply[targetSessionId];
+              const isDuplicate =
+                last && last.content === lastMessage.content &&
+                (typeof lastMessage.timestamp !== "undefined" ? last.timestamp === lastMessage.timestamp : true);
+
+              if (!isDuplicate) {
+                // Tag the reply with the target's identity so the message renderer
+                // shows who replied. The reply content itself may already have
+                // sender_info from the target if they used send_to_session to reply,
+                // but we tag it here as a fallback so it always shows a sender.
+                const alreadyTagged = lastMessage.content.includes("<sender_info>");
+                const tag = alreadyTagged
+                  ? ""
+                  : `\n\n<sender_info>${JSON.stringify({
+                      sessionId: targetSessionId,
+                      sessionName: targetSessionName || undefined,
+                    })}</sender_info>`;
+                // Inject the reply into the current session as a display-only message
+                pi.sendMessage(
+                  {
+                    customType: SESSION_MESSAGE_TYPE,
+                    content: lastMessage.content + tag,
+                    display: true,
+                  },
+                  { triggerTurn: false },
+                );
+                lastInjectedAsyncReply[targetSessionId] = {
+                  content: lastMessage.content,
+                  timestamp: lastMessage.timestamp,
+                };
+              }
             }
             return;
           }
@@ -1848,10 +1863,7 @@ Messages automatically include sender session info for replies. When you want a 
 
       try {
         if (action === "get_message") {
-          if (!(ctx && (ctx as any).explicitGetMessage)) {
-            // This is an automated/background get_message - suppress output
-            return { content: [], details: { suppressed: true } };
-          }
+          // No suppression: always display output (restored as requested)
           const result = await sendViaRelay(targetSessionId, { type: "get_message" });
           if (!result.response.success) {
             return {
