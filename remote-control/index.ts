@@ -754,8 +754,6 @@ async function sendDaemonCommand(
     socket.once("connect", () => {
       // Normalize start/kill as new command names
       let req = request;
-      if (req.type === "/tcp-daemon-start") req = { type: "/start-daemon" };
-      if (req.type === "/tcp-daemon-end") req = { type: "/kill-daemon" };
       socket.write(`${JSON.stringify(req)}\n`);
     });
 
@@ -2099,13 +2097,42 @@ export default function (pi: ExtensionAPI) {
   registerListPeersTool(pi, state);
   registerListTailscaleTool(pi, state);
 
-  // Register /tcp-daemon-start command
-  pi.registerCommand("tcp-daemon-start", {
+  // Register /start-daemon command
+  // Improved daemon startup check
+  async function isDaemonActive(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const client = net.createConnection(DAEMON_SOCK);
+      client.setTimeout(1500);
+      client.once('error', () => resolve(false));
+      client.once('timeout', () => {
+        client.destroy();
+        resolve(false);
+      });
+      client.once('connect', () => {
+        client.write(JSON.stringify({ type: "status" }) + "\n");
+      });
+      client.once('data', (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          resolve(msg && msg.success !== undefined);
+        } catch {
+          resolve(false);
+        }
+        client.destroy();
+      });
+    });
+  }
+
+  pi.registerCommand("start-daemon", {
     description: "Start the remote control daemon (background process)",
     handler: async (_args, ctx) => {
       if (fs.existsSync(DAEMON_SOCK)) {
-        ctx.hasUI && ctx.ui.notify("Daemon already running", "info");
-        return;
+        if (await isDaemonActive()) {
+          ctx.hasUI && ctx.ui.notify("Daemon already running", "info");
+          return;
+        }
+        // Socket exists but daemon isn't responding; treat as stale
+        try { fs.unlinkSync(DAEMON_SOCK); } catch {/* ignore */}
       }
       ctx.hasUI && ctx.ui.notify("Starting daemon...", "info");
       const started = await spawnDaemon();
@@ -2117,8 +2144,8 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Register /tcp-daemon-end command
-  pi.registerCommand("tcp-daemon-end", {
+  // Register /kill-daemon command
+  pi.registerCommand("kill-daemon", {
     description: "Stop the remote control daemon (background process)",
     handler: async (_args, ctx) => {
       if (!fs.existsSync(DAEMON_SOCK)) {

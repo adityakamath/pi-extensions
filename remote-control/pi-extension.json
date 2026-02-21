@@ -14,8 +14,8 @@
     "remove_peer",
     "list_peers",
     "list_tailscale",
-    "/tcp-daemon-start",
-    "/tcp-daemon-end"
+    "/start-daemon",
+    "/kill-daemon"
   ],
   "author": "Aditya Kamath",
   "version": "0.2.0"

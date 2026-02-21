@@ -13,15 +13,15 @@ The Remote Control extension enables cross-machine communication and orchestrati
 - Tools:
   - `list_remotes`: Discover all live sessions (local/remote)
   - `send_to_remote`: Send messages, summaries, and commands to any session
-  - `/tcp-daemon-start`: Start the background daemon
-  - `/tcp-daemon-end`: Stop the daemon
+  - `/start-daemon`: Start the daemon
+  - `/kill-daemon`: Stop the daemon
 - Alias symlinks for session discovery/use
 - Peer discovery via TCP, supporting multi-machine and subnetwork coordination
 
 ## Usage
 
 ### Daemon
-- The daemon is auto-started when tools or `/tcp-daemon-start` are used.
+- The daemon is auto-started when tools or `/start-daemon` are used.
 - Spawn manually:
   ```bash
   node daemon.js
@@ -31,8 +31,8 @@ The Remote Control extension enables cross-machine communication and orchestrati
 - Daemon listens at `~/.pi/remote-control/daemon.sock` and on TCP (default port 7433).
 
 ### Commands
-- `/tcp-daemon-start`: Start the remote control daemon (background process)
-- `/tcp-daemon-end`: Stop the daemon
+- `/start-daemon`: Start the remote control daemon (background process)
+- `/kill-daemon`: Stop the daemon
 
 ### Tools (via Pi)
 - `list_remotes`: Lists all live sessions
