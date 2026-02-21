@@ -7,7 +7,7 @@
  *    session discovery, peer connections (TCP), and command relay.
  *
  * Every session automatically creates a control socket — no flag required.
- * The daemon is started on-demand when /remote commands or send_to_remote tool are used.
+ * The daemon is started on-demand when /remote commands or send_to_session tool are used.
  *
  * RPC Protocol (session socket):
  *   Commands are newline-delimited JSON with a `type` field:
@@ -44,7 +44,7 @@ import * as fs from "node:fs";
 import { promises as fsPromises } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, exec } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 import {
@@ -956,7 +956,7 @@ function updateSessionEnv(ctx: ExtensionContext | null, enabled: boolean): void 
 }
 
 // ============================================================================
-// RPC Client (for send_to_remote tool)
+// RPC Client (for send_to_session tool)
 // ============================================================================
 
 interface RpcClientOptions {
@@ -1110,12 +1110,12 @@ async function sendViaRelay(
 
 
 // ============================================================================
-// Tool: list_remotes
+// Tool: list_sessions
 // ============================================================================
 
-function registerListRemotesTool(pi: ExtensionAPI, state: SocketState): void {
+function registerListSessionsTool(pi: ExtensionAPI, state: SocketState): void {
   pi.registerTool({
-    name: "list_remotes",
+    name: "list_sessions",
     label: "List Sessions",
     description:
       "List live sessions that expose a control socket (optionally with session names). Use this for discovery only; for the current session id in shell/bash use $PI_SESSION_ID.",
@@ -1217,7 +1217,285 @@ function registerListRemotesTool(pi: ExtensionAPI, state: SocketState): void {
 }
 
 // ============================================================================
-// Tool: send_to_remote
+// Tool: add_peer
+// ============================================================================
+
+function registerAddPeerTool(pi: ExtensionAPI, state: SocketState): void {
+  pi.registerTool({
+    name: "add_peer",
+    label: "Add Peer",
+    description:
+      "Connect to a remote machine running a pi remote-control daemon. " +
+      "Provide a hostname or IP address (and optional port). " +
+      "The daemon will be auto-started if not already running. " +
+      "Once connected, all sessions on that machine become available via list_sessions and send_to_session.",
+    parameters: Type.Object({
+      host: Type.String({
+        description: "Hostname, IP address, or Tailscale machine name to connect to (e.g. 'my-macbook', '192.168.1.5', 'my-macbook:7433')",
+      }),
+      port: Type.Optional(Type.Number({
+        description: "TCP port the remote daemon is listening on (default: 7433)",
+      })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const started = await ensureDaemon(ctx);
+      if (!started) {
+        return {
+          content: [{ type: "text", text: "Failed to start daemon" }],
+          isError: true,
+          details: { error: "Daemon failed to start" },
+        };
+      }
+
+      try {
+        const resp = await sendDaemonCommand(
+          { type: "add_peer", host: params.host, port: params.port },
+          12000,
+        );
+        if (!resp.success) {
+          return {
+            content: [{ type: "text", text: `Failed to connect to peer: ${resp.error ?? "unknown error"}` }],
+            isError: true,
+            details: resp,
+          };
+        }
+        const data = resp.data as { host: string; port: number };
+        return {
+          content: [{ type: "text", text: `Connected to peer ${data.host}:${data.port}` }],
+          details: data,
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (ctx?.hasUI) ctx.ui.notify(`❌ add_peer failed: ${message}`, "error");
+        return {
+          content: [{ type: "text", text: `Failed: ${message}` }],
+          isError: true,
+          details: { error: message },
+        };
+      }
+    },
+  });
+}
+
+// ============================================================================
+// Tool: remove_peer
+// ============================================================================
+
+function registerRemovePeerTool(pi: ExtensionAPI, state: SocketState): void {
+  pi.registerTool({
+    name: "remove_peer",
+    label: "Remove Peer",
+    description:
+      "Disconnect from a remote machine and remove it from the peer list. " +
+      "All sessions from that machine will no longer be visible.",
+    parameters: Type.Object({
+      host: Type.String({
+        description: "Hostname or IP address of the peer to remove",
+      }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (!fs.existsSync(DAEMON_SOCK)) {
+        return {
+          content: [{ type: "text", text: "Daemon is not running — no peers to remove" }],
+          isError: true,
+          details: { error: "Daemon not running" },
+        };
+      }
+
+      try {
+        const resp = await sendDaemonCommand({ type: "remove_peer", host: params.host }, 5000);
+        if (!resp.success) {
+          return {
+            content: [{ type: "text", text: `Failed to remove peer: ${resp.error ?? "unknown error"}` }],
+            isError: true,
+            details: resp,
+          };
+        }
+        const data = resp.data as { host: string };
+        return {
+          content: [{ type: "text", text: `Disconnected from peer ${data.host}` }],
+          details: data,
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (ctx?.hasUI) ctx.ui.notify(`❌ remove_peer failed: ${message}`, "error");
+        return {
+          content: [{ type: "text", text: `Failed: ${message}` }],
+          isError: true,
+          details: { error: message },
+        };
+      }
+    },
+  });
+}
+
+// ============================================================================
+// Tool: list_peers
+// ============================================================================
+
+function registerListPeersTool(pi: ExtensionAPI, state: SocketState): void {
+  pi.registerTool({
+    name: "list_peers",
+    label: "List Peers",
+    description:
+      "List all remote machines currently connected to the daemon, including connection status and how many sessions each exposes.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      if (!fs.existsSync(DAEMON_SOCK)) {
+        return {
+          content: [{ type: "text", text: "Daemon is not running — no peers connected" }],
+          details: { peers: [] },
+        };
+      }
+
+      try {
+        const resp = await sendDaemonCommand({ type: "status" }, 5000);
+        if (!resp.success) {
+          return {
+            content: [{ type: "text", text: `Failed to get peer list: ${resp.error ?? "unknown error"}` }],
+            isError: true,
+            details: resp,
+          };
+        }
+        const data = resp.data as {
+          peers: Array<{ host: string; port: number; connected: boolean; sessionCount: number }>;
+          localSessionCount: number;
+          remotePeerCount: number;
+          port: number;
+          uptime: number;
+        };
+        const peers = (data.peers ?? []).filter((p) => p.host !== "127.0.0.1");
+        if (peers.length === 0) {
+          return {
+            content: [{ type: "text", text: "No peers configured. Use add_peer to connect to a remote machine." }],
+            details: { peers: [] },
+          };
+        }
+        const lines = peers.map((p) => {
+          const status = p.connected ? "✅ connected" : "❌ disconnected";
+          return `- ${p.host}:${p.port} — ${status}, ${p.sessionCount} session(s)`;
+        });
+        const summary = `Daemon on port ${data.port} | uptime ${data.uptime}s | ${data.localSessionCount} local session(s)\n\nPeers:\n${lines.join("\n")}`;
+        return {
+          content: [{ type: "text", text: summary }],
+          details: { peers, daemonStatus: data },
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (ctx?.hasUI) ctx.ui.notify(`❌ list_peers failed: ${message}`, "error");
+        return {
+          content: [{ type: "text", text: `Failed: ${message}` }],
+          isError: true,
+          details: { error: message },
+        };
+      }
+    },
+  });
+}
+
+// ============================================================================
+// Tool: list_tailscale
+// ============================================================================
+
+function registerListTailscaleTool(pi: ExtensionAPI, state: SocketState): void {
+  pi.registerTool({
+    name: "list_tailscale",
+    label: "List Tailscale Peers",
+    description:
+      "List machines on your Tailscale network. Use this to discover hostnames you can pass to add_peer to connect remote pi agents.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const started = await ensureDaemon(ctx);
+      if (!started) {
+        // Fallback: try running tailscale directly if daemon won't start
+        return new Promise((resolve) => {
+          exec("tailscale status --json", (error, stdout, stderr) => {
+            if (error) {
+              const msg = error.message.includes("not found") || error.message.includes("ENOENT")
+                ? "tailscale not found — is Tailscale installed and running?"
+                : `tailscale error: ${stderr || error.message}`;
+              resolve({
+                content: [{ type: "text", text: msg }],
+                isError: true,
+                details: { error: msg },
+              });
+              return;
+            }
+            try {
+              const data = JSON.parse(stdout) as { Peer?: Record<string, { HostName?: string; DNSName?: string; TailscaleIPs?: string[] }> };
+              const peers = Object.values(data.Peer ?? {})
+                .filter((p) => p.HostName && p.HostName !== "funnel-ingress-node")
+                .map((p) => ({
+                  hostname: (p.DNSName ?? "").replace(/\.$/, "").split(".")[0],
+                  ip: p.TailscaleIPs?.[0] ?? "",
+                }));
+              if (peers.length === 0) {
+                resolve({ content: [{ type: "text", text: "No Tailscale peers found." }], details: { peers: [] } });
+                return;
+              }
+              const lines = peers.map((p) => {
+                let line = `-`;
+                if (p.hostname) line += ` ${p.hostname}`;
+                if (p.ip) line += ` — ${p.ip}`;
+                return line;
+              });
+              resolve({
+                content: [{ type: "text", text: `Tailscale peers:\n${lines.join("\n")}` }],
+                details: { peers },
+              });
+            } catch (parseErr) {
+              resolve({
+                content: [{ type: "text", text: `Failed to parse tailscale output: ${parseErr}` }],
+                isError: true,
+                details: { error: String(parseErr) },
+              });
+            }
+          });
+        });
+      }
+
+      try {
+        const resp = await sendDaemonCommand({ type: "list_tailscale" }, 10000);
+        if (!resp.success) {
+          return {
+            content: [{ type: "text", text: `Failed to list Tailscale peers: ${resp.error ?? "unknown error"}` }],
+            isError: true,
+            details: resp,
+          };
+        }
+        const data = resp.data as { peers: Array<{ hostname: string; ip: string }> };
+        const peers = data.peers ?? [];
+        if (peers.length === 0) {
+          return {
+            content: [{ type: "text", text: "No Tailscale peers found." }],
+            details: { peers: [] },
+          };
+        }
+        const lines = peers.map((p) => {
+          let line = `-`;
+          if (p.hostname) line += ` ${p.hostname}`;
+          if (p.ip) line += ` — ${p.ip}`;
+          return line;
+        });
+        return {
+          content: [{ type: "text", text: `Tailscale peers:\n${lines.join("\n")}\n\nUse add_peer with any of these hostnames to connect.` }],
+          details: { peers },
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (ctx?.hasUI) ctx.ui.notify(`❌ list_tailscale failed: ${message}`, "error");
+        return {
+          content: [{ type: "text", text: `Failed: ${message}` }],
+          isError: true,
+          details: { error: message },
+        };
+      }
+    },
+  });
+}
+
+// ============================================================================
+// Tool: send_to_session
 // ============================================================================
 
 async function resolveSessionIdFromDaemon(sessionName: string): Promise<string | null> {
@@ -1254,9 +1532,9 @@ async function resolveSessionIdFromAliasLocal(alias: string): Promise<string | n
   }
 }
 
-function registerSendToRemoteTool(pi: ExtensionAPI, state: SocketState): void {
+function registerSendToSessionTool(pi: ExtensionAPI, state: SocketState): void {
   pi.registerTool({
-    name: "send_to_remote",
+    name: "send_to_session",
     label: "Send To Session",
     description: `Interact with another running pi session via its control socket.
 
@@ -1276,7 +1554,7 @@ Wait behavior (only for action=send):
 
 Note: If you ask the target session to reply back via sender_info, do not use wait_until; waiting is redundant and can duplicate responses.
 
-Messages automatically include sender session info for replies. When you want a response, instruct the target session to reply directly to the sender by calling send_to_remote with the sender_info reference (do not poll get_message).`,
+Messages automatically include sender session info for replies. When you want a response, instruct the target session to reply directly to the sender by calling send_to_session with the sender_info reference (do not poll get_message).`,
     parameters: Type.Object({
       sessionId: Type.Optional(Type.String({ description: "Target session id (UUID)" })),
       sessionName: Type.Optional(Type.String({ description: "Target session name (alias)" })),
@@ -1465,19 +1743,21 @@ Messages automatically include sender session info for replies. When you want a 
           };
         }
 
+        if (params.wait_until === "message_processed") {
+          // Fire-and-forget: do not await, return immediately
+          void sendViaRelay(targetSessionId, sendCommand);
+          return {
+            content: [{ type: "text", text: `Message queued for session ${displayTarget || targetSessionId}` }],
+            details: { queued: true },
+          };
+        }
+
         const result = await sendViaRelay(targetSessionId, sendCommand);
         if (!result.response.success) {
           return {
             content: [{ type: "text", text: `Failed: ${result.response.error ?? "unknown error"}` }],
             isError: true,
             details: result,
-          };
-        }
-
-        if (params.wait_until === "message_processed") {
-          return {
-            content: [{ type: "text", text: "Message delivered to session" }],
-            details: result.response.data,
           };
         }
 
@@ -1610,6 +1890,10 @@ Messages automatically include sender session info for replies. When you want a 
         return new Text(`${icon} ${theme.fg("muted", msg)}`, 0, 0);
       }
 
+      if (details && "queued" in details) {
+        return new Text(`${theme.fg("success", "✓")}${theme.fg("muted", " Message queued")}`, 0, 0);
+      }
+
       if (details && "delivered" in details) {
         const mode = details.mode as string | undefined;
         const icon = theme.fg("success", "✓");
@@ -1642,8 +1926,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerMessageRenderer(SESSION_MESSAGE_TYPE, renderSessionMessage);
 
-  registerListRemotesTool(pi, state);
-  registerSendToRemoteTool(pi, state);
+  registerListSessionsTool(pi, state);
+  registerSendToSessionTool(pi, state);
+  registerAddPeerTool(pi, state);
+  registerRemovePeerTool(pi, state);
+  registerListPeersTool(pi, state);
+  registerListTailscaleTool(pi, state);
 
   // Register /tcp-daemon-start command
   pi.registerCommand("tcp-daemon-start", {

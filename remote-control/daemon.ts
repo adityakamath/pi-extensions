@@ -790,8 +790,13 @@ async function handleDaemonCommand(socket: net.Socket, req: DaemonRequest): Prom
           return;
         }
         try {
-          const data = JSON.parse(stdout) as { Peer?: Record<string, { HostName?: string }> };
-          const peers = Object.values(data.Peer ?? {}).map((p) => p.HostName).filter(Boolean);
+          const data = JSON.parse(stdout) as { Peer?: Record<string, { HostName?: string; DNSName?: string; TailscaleIPs?: string[] }> };
+          const peers = Object.values(data.Peer ?? {})
+            .filter((p) => p.HostName && p.HostName !== "funnel-ingress-node")
+            .map((p) => ({
+              hostname: (p.DNSName ?? "").replace(/\.$/, "").split(".")[0],
+              ip: p.TailscaleIPs?.[0] ?? "",
+            }));
           sendDaemonResponse(socket, "list_tailscale", true, { peers });
         } catch (err) {
           sendDaemonResponse(socket, "list_tailscale", false, undefined, `Failed to parse tailscale output: ${err}`);

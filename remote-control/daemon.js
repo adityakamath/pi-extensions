@@ -679,7 +679,10 @@ async function handleDaemonCommand(socket, req) {
         }
         try {
           const data = JSON.parse(stdout);
-          const peers = Object.values(data.Peer ?? {}).map((p) => p.HostName).filter(Boolean);
+          const peers = Object.values(data.Peer ?? {}).filter((p) => p.HostName && p.HostName !== "funnel-ingress-node").map((p) => ({
+            hostname: (p.DNSName ?? "").replace(/\.$/, "").split(".")[0],
+            ip: p.TailscaleIPs?.[0] ?? ""
+          }));
           sendDaemonResponse(socket, "list_tailscale", true, { peers });
         } catch (err) {
           sendDaemonResponse(socket, "list_tailscale", false, void 0, `Failed to parse tailscale output: ${err}`);

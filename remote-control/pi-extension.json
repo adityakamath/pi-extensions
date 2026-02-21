@@ -8,10 +8,11 @@
     "controlSocket": "~/.pi/remote-control/daemon.sock"
   },
   "tools": [
+    "list_sessions",
+    "send_to_session",
     "add_peer",
     "remove_peer",
     "list_peers",
-    "send_to_peer",
     "list_tailscale",
     "/tcp-daemon-start",
     "/tcp-daemon-end"
