@@ -489,10 +489,11 @@ function setupPeerSocket(peer: PeerEntry, socket: net.Socket): void {
       peer._lastStatus = 'disconnected';
     }
 
-    // Reconnect unless explicitly removed
-    if (!peer.removed) {
-      scheduleReconnect(peer);
-    } else {
+    // Do not reconnect automatically; notify user to reconnect manually
+    peer.gaveUp = true;
+    log(`Peer ${peer.host} disconnected. No automatic reconnect. Ask user to reconnect manually if needed.`);
+    pushEvent({ type: "event", event: "peer_gave_up", data: { host: peer.host } });
+    if (peer.removed) {
       remotePeers.delete(peer.host);
     }
     resetAutoShutdown();

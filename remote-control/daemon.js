@@ -41,9 +41,11 @@ let tcpServer = null;
 let daemonServer = null;
 let fsWatcher = null;
 function resetAutoShutdown() {
-  if (autoShutdownTimer) clearTimeout(autoShutdownTimer);
+  if (autoShutdownTimer)
+    clearTimeout(autoShutdownTimer);
   const timeoutMs = config.autoShutdownTimeout * 1e3;
-  if (timeoutMs <= 0) return;
+  if (timeoutMs <= 0)
+    return;
   autoShutdownTimer = setTimeout(() => {
     const noLocal = localSessions.size === 0;
     const noPeers = remotePeers.size === 0 || [...remotePeers.values()].every((p) => !p.connected);
@@ -59,8 +61,10 @@ function resetAutoShutdown() {
 }
 function cleanup() {
   log("Cleaning up...");
-  if (heartbeatTimer) clearInterval(heartbeatTimer);
-  if (autoShutdownTimer) clearTimeout(autoShutdownTimer);
+  if (heartbeatTimer)
+    clearInterval(heartbeatTimer);
+  if (autoShutdownTimer)
+    clearTimeout(autoShutdownTimer);
   if (fsWatcher) {
     try {
       fsWatcher.close();
@@ -68,7 +72,8 @@ function cleanup() {
     }
   }
   for (const peer of remotePeers.values()) {
-    if (peer.reconnectTimer) clearTimeout(peer.reconnectTimer);
+    if (peer.reconnectTimer)
+      clearTimeout(peer.reconnectTimer);
     if (peer.socket) {
       try {
         peer.socket.destroy();
@@ -162,8 +167,10 @@ async function verifySocketAlive(socketPath, timeoutMs = 300) {
 async function addLocalSession(sockFile) {
   const base = path.basename(sockFile, SOCKET_SUFFIX);
   const sessionId = base;
-  if (!isSafeSessionId(sessionId)) return;
-  if (localSessions.has(sessionId)) return;
+  if (!isSafeSessionId(sessionId))
+    return;
+  if (localSessions.has(sessionId))
+    return;
   const socketPath = path.join(CONTROL_DIR, sockFile);
   const alive = await verifySocketAlive(socketPath);
   if (!alive) {
@@ -186,7 +193,8 @@ async function addLocalSession(sockFile) {
 }
 function removeLocalSession(sessionId) {
   const entry = localSessions.get(sessionId);
-  if (!entry) return;
+  if (!entry)
+    return;
   localSessions.delete(sessionId);
   removeSessionName(sessionId);
   log(`Local session removed: ${sessionId}`);
@@ -209,9 +217,12 @@ async function scanLocalSessions() {
 function startFsWatch() {
   try {
     fsWatcher = fs.watch(CONTROL_DIR, async (eventType, filename) => {
-      if (!filename) return;
-      if (!filename.endsWith(SOCKET_SUFFIX)) return;
-      if (filename === path.basename(DAEMON_SOCK)) return;
+      if (!filename)
+        return;
+      if (!filename.endsWith(SOCKET_SUFFIX))
+        return;
+      if (filename === path.basename(DAEMON_SOCK))
+        return;
       const sockFile = filename;
       const socketPath = path.join(CONTROL_DIR, sockFile);
       const sessionId = path.basename(sockFile, SOCKET_SUFFIX);
@@ -260,11 +271,14 @@ function handlePeerMessage(peer, msg) {
         peer.sessions.set(session.sessionId, session);
       }
       log(`Peer ${peer.host} hello with ${msg.sessions.length} sessions.`);
-      pushEvent({
-        type: "event",
-        event: "peer_connected",
-        data: { host: peer.host, sessionCount: msg.sessions.length }
-      });
+      if (peer._lastStatus !== "connected" && peer.gaveUp !== true) {
+        pushEvent({
+          type: "event",
+          event: "peer_connected",
+          data: { host: peer.host, sessionCount: msg.sessions.length }
+        });
+        peer._lastStatus = "connected";
+      }
       break;
     }
     case "heartbeat": {
@@ -361,18 +375,25 @@ function setupPeerSocket(peer, socket) {
   let buffer = "";
   socket.setKeepAlive(true, 1e4);
   socket.setEncoding("utf8");
+  let lastStatus = null;
   socket.on("data", (chunk) => {
     buffer += chunk;
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed) continue;
+      if (!trimmed)
+        continue;
       try {
         const msg = JSON.parse(trimmed);
         if (msg.type === "hello" && !peer.connected) {
           peer.connected = true;
           peer.reconnectAttempts = 0;
+          if (lastStatus !== "connected") {
+            handlePeerMessage(peer, msg);
+            lastStatus = "connected";
+          }
+          continue;
         }
         handlePeerMessage(peer, msg);
       } catch (err) {
@@ -395,22 +416,26 @@ function setupPeerSocket(peer, socket) {
         data: { sessionId: session.sessionId, host: peer.host, isRemote: true }
       });
     }
-    if (wasConnected) {
+    if (wasConnected && peer.gaveUp !== true && (!peer._lastStatus || peer._lastStatus !== "disconnected")) {
       pushEvent({ type: "event", event: "peer_disconnected", data: { host: peer.host } });
+      peer._lastStatus = "disconnected";
     }
-    if (!peer.removed) {
-      scheduleReconnect(peer);
-    } else {
+    peer.gaveUp = true;
+    log(`Peer ${peer.host} disconnected. No automatic reconnect. Ask user to reconnect manually if needed.`);
+    pushEvent({ type: "event", event: "peer_gave_up", data: { host: peer.host } });
+    if (peer.removed) {
       remotePeers.delete(peer.host);
     }
     resetAutoShutdown();
   });
 }
 function scheduleReconnect(peer) {
-  if (peer.removed || peer.gaveUp) return;
+  if (peer.removed || peer.gaveUp)
+    return;
   if (peer.reconnectAttempts >= 1) {
     peer.gaveUp = true;
     log(`Peer ${peer.host} reconnect failed. Giving up.`);
+    peer._lastStatus = "gaveUp";
     pushEvent({ type: "event", event: "peer_gave_up", data: { host: peer.host } });
     return;
   }
@@ -459,7 +484,8 @@ function startHeartbeat() {
     const heartbeatMsg = JSON.stringify({ type: "heartbeat" }) + "\n";
     const now = Date.now();
     for (const peer of remotePeers.values()) {
-      if (!peer.connected || !peer.socket) continue;
+      if (!peer.connected || !peer.socket)
+        continue;
       if (now - peer.lastSeen > deadThreshold) {
         log(`Peer ${peer.host} timed out (no message for ${deadThreshold}ms). Closing.`);
         peer.socket.destroy();
@@ -508,7 +534,8 @@ async function relayToLocalSocket(socketPath, rpcCommand, timeoutMs) {
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed) continue;
+        if (!trimmed)
+          continue;
         if (!done) {
           done = true;
           clearTimeout(timer);
@@ -653,7 +680,8 @@ async function handleDaemonCommand(socket, req) {
         });
       }
       for (const peer of remotePeers.values()) {
-        if (!peer.connected) continue;
+        if (!peer.connected)
+          continue;
         for (const session of peer.sessions.values()) {
           sessions.push({
             ...session,
@@ -805,8 +833,12 @@ async function handleDaemonCommand(socket, req) {
       sendDaemonResponse(socket, "subscribe", true, { subscribed: true });
       break;
     }
-    case "kill": {
-      sendDaemonResponse(socket, "kill", true, { message: "Shutting down" });
+    case "/start-daemon": {
+      sendDaemonResponse(socket, "/start-daemon", true, { message: "Daemon already running" });
+      break;
+    }
+    case "/kill-daemon": {
+      sendDaemonResponse(socket, "/kill-daemon", true, { message: "Shutting down" });
       log("Kill command received. Shutting down.");
       setImmediate(() => {
         cleanup();
@@ -842,7 +874,8 @@ function startDaemonServer() {
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed) continue;
+        if (!trimmed)
+          continue;
         if (!checkMaxMsgSize(trimmed)) {
           try {
             socket.write(JSON.stringify({ type: "error", error: `Message size exceeds ${MAX_MSG_BYTES} bytes` }) + "\n");
@@ -906,7 +939,8 @@ function startTcpServer() {
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed) continue;
+        if (!trimmed)
+          continue;
         if (!checkMaxMsgSize(trimmed)) {
           try {
             socket.write(JSON.stringify({ type: "error", error: `Message size exceeds ${MAX_MSG_BYTES} bytes` }) + "\n");

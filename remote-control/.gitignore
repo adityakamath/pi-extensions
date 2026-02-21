@@ -1,0 +1,5 @@
+# Ignore build artifacts
+shared.js
+daemon.js
+node_modules/
+package-lock.json
