@@ -15,7 +15,8 @@
     "list_peers",
     "list_tailscale",
     "/start-daemon",
-    "/kill-daemon"
+    "/kill-daemon",
+    "/refresh-daemon"
   ],
   "author": "Aditya Kamath",
   "version": "0.2.0"

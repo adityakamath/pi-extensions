@@ -846,6 +846,15 @@ async function handleDaemonCommand(socket, req) {
       });
       break;
     }
+    case "/refresh-daemon": {
+      try {
+        await scanLocalSessions();
+        sendDaemonResponse(socket, "/refresh-daemon", true, { message: "Refreshed local session and peer state" });
+      } catch (err) {
+        sendDaemonResponse(socket, "/refresh-daemon", false, void 0, err instanceof Error ? err.message : String(err));
+      }
+      break;
+    }
     default: {
       sendDaemonResponse(socket, req.type, false, void 0, "Unknown command");
     }

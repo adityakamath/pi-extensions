@@ -33,12 +33,14 @@ The Remote Control extension enables cross-machine communication and orchestrati
 ### Commands
 - `/start-daemon`: Start the remote control daemon (background process)
 - `/kill-daemon`: Stop the daemon
+- `/refresh-daemon`: Refresh daemon session and peer state. Forces a rescan of local sessions and peers.
 
 ### Tools (via Pi)
 - `list_remotes`: Lists all live sessions
 - `send_to_remote`: Send messages/commands to a session by ID or alias
-- `add_peer`: Connect to another machine/peer
-- `remove_peer`: Disconnect a peer
+- `add_peer`: Connect to another machine/peer. Automatically triggers `/refresh-daemon` internally.
+- `remove_peer`: Disconnect a peer. Automatically triggers `/refresh-daemon` internally.
+- `refresh_daemon`: Refresh daemon session and peer state (user-callable tool, maps to `/refresh-daemon` command)
 - `list_peers`: Enumerate known peers
 - `list_tailscale`: Tailscale network peer discovery
 

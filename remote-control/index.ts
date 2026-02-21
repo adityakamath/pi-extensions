@@ -1372,6 +1372,44 @@ function registerListSessionsTool(pi: ExtensionAPI, state: SocketState): void {
 }
 
 // ============================================================================
+// Tool: daemon_refresh
+// ============================================================================
+
+function registerDaemonRefreshTool(pi: ExtensionAPI, state: SocketState): void {
+  pi.registerTool({
+    name: "refresh_daemon",
+    label: "Refresh Daemon",
+    description: "Refresh daemon session and peer state. Forces a rescan of all sessions and peers.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      if (!fs.existsSync(DAEMON_SOCK)) {
+        return {
+          content: [{ type: "text", text: "Daemon is not running — cannot refresh." }],
+          isError: true,
+        };
+      }
+      try {
+        const resp = await sendDaemonCommand({ type: "/refresh-daemon" }, 5000);
+        if (!resp.success) {
+          return {
+            content: [{ type: "text", text: `Refresh failed: ${resp.error ?? "unknown error"}` }],
+            isError: true,
+          };
+        }
+        return {
+          content: [{ type: "text", text: resp.data?.message ?? "Daemon refreshed." }],
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Refresh failed: ${err instanceof Error ? err.message : String(err)}` }],
+          isError: true,
+        };
+      }
+    },
+  });
+}
+
+// ============================================================================
 // Tool: add_peer
 // ============================================================================
 
@@ -1414,6 +1452,8 @@ function registerAddPeerTool(pi: ExtensionAPI, state: SocketState): void {
             details: resp,
           };
         }
+        // Refresh daemon after adding peer
+        await sendDaemonCommand({ type: "/refresh-daemon" }, 5000);
         const data = resp.data as { host: string; port: number };
         return {
           content: [{ type: "text", text: `Connected to peer ${data.host}:${data.port}` }],
@@ -1466,6 +1506,8 @@ function registerRemovePeerTool(pi: ExtensionAPI, state: SocketState): void {
             details: resp,
           };
         }
+        // Refresh daemon after removing peer
+        await sendDaemonCommand({ type: "/refresh-daemon" }, 5000);
         const data = resp.data as { host: string };
         return {
           content: [{ type: "text", text: `Disconnected from peer ${data.host}` }],

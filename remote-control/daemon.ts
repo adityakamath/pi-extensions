@@ -990,6 +990,16 @@ async function handleDaemonCommand(socket: net.Socket, req: DaemonRequest): Prom
       break;
     }
 
+    case "/refresh-daemon": {
+      try {
+        await scanLocalSessions();
+        sendDaemonResponse(socket, "/refresh-daemon", true, { message: "Refreshed local session and peer state" });
+      } catch (err) {
+        sendDaemonResponse(socket, "/refresh-daemon", false, undefined, err instanceof Error ? err.message : String(err));
+      }
+      break;
+    }
+
     default: {
       sendDaemonResponse(socket, (req as { type: string }).type, false, undefined, "Unknown command");
     }
