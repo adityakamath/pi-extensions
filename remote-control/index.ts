@@ -171,6 +171,7 @@ interface ExtractedMessage {
 interface SenderInfo {
   sessionId?: string;
   sessionName?: string;
+  hostname?: string;
 }
 
 // ============================================================================
@@ -394,11 +395,12 @@ function parseSenderInfo(text: string): SenderInfo | null {
   if (!raw) return null;
   if (raw.startsWith("{")) {
     try {
-      const parsed = JSON.parse(raw) as { sessionId?: unknown; sessionName?: unknown };
+      const parsed = JSON.parse(raw) as { sessionId?: unknown; sessionName?: unknown; hostname?: unknown };
       const sessionId = typeof parsed.sessionId === "string" ? parsed.sessionId.trim() : "";
       const sessionName = typeof parsed.sessionName === "string" ? parsed.sessionName.trim() : "";
+      const hostname = typeof parsed.hostname === "string" ? parsed.hostname.trim() : "";
       if (sessionId || sessionName) {
-        return { sessionId: sessionId || undefined, sessionName: sessionName || undefined };
+        return { sessionId: sessionId || undefined, sessionName: sessionName || undefined, hostname: hostname || undefined };
       }
     } catch {
       // fall through to legacy
@@ -411,11 +413,12 @@ function parseSenderInfo(text: string): SenderInfo | null {
 
 function formatSenderInfo(info: SenderInfo | null): string | null {
   if (!info) return null;
-  const { sessionName, sessionId } = info;
-  if (sessionName && sessionId) return `${sessionName} (${sessionId})`;
-  if (sessionName) return sessionName;
-  if (sessionId) return sessionId;
-  return null;
+  const { sessionName, sessionId, hostname } = info;
+  const identity = sessionId
+    ? sessionName ? `${sessionId} (${sessionName})` : sessionId
+    : sessionName ?? null;
+  if (!identity) return null;
+  return hostname ? `${identity} [remote: ${hostname}]` : identity;
 }
 
 // ============================================================================
@@ -749,7 +752,11 @@ async function sendDaemonCommand(
     let buffer = "";
 
     socket.once("connect", () => {
-      socket.write(`${JSON.stringify(request)}\n`);
+      // Normalize start/kill as new command names
+      let req = request;
+      if (req.type === "/tcp-daemon-start") req = { type: "/start-daemon" };
+      if (req.type === "/tcp-daemon-end") req = { type: "/kill-daemon" };
+      socket.write(`${JSON.stringify(req)}\n`);
     });
 
     socket.on("data", (chunk) => {
@@ -893,6 +900,9 @@ function subscribeToDaemonEvents(ctx: ExtensionContext, state: SocketState): voi
   }
 }
 
+// Track which peers we've already shown a disconnect warning for, to avoid repeating it.
+const _warnedPeers = new Set<string>();
+
 function handleDaemonEvent(event: DaemonEvent, ctx: ExtensionContext): void {
   if (!ctx.hasUI) return;
 
@@ -907,21 +917,29 @@ function handleDaemonEvent(event: DaemonEvent, ctx: ExtensionContext): void {
       break;
     }
     case "session_removed": {
-      if (!data?.isRemote) break;
-      const name = (data.name as string | undefined) || (data.sessionId as string | undefined) || "unknown";
-      const host = (data.host as string | undefined) || "unknown";
-      ctx.ui.notify(`🔌 Remote session disconnected: ${name} on ${host}`, "info");
+      // Suppress per-session removal noise when a peer disconnects —
+      // peer_disconnected already surfaces one clear warning.
       break;
     }
     case "peer_connected": {
       const host = (data?.host as string | undefined) || "unknown";
       const sessionCount = (data?.sessionCount as number | undefined) ?? 0;
+      // Clear the warned flag so future disconnects show a warning again.
+      _warnedPeers.delete(host);
       ctx.ui.notify(`🌐 Connected to peer: ${host} (${sessionCount} sessions)`, "info");
       break;
     }
     case "peer_disconnected": {
       const host = (data?.host as string | undefined) || "unknown";
-      ctx.ui.notify(`⚠️ Lost connection to ${host} — reconnecting...`, "warning");
+      // Only show warning once per peer; the daemon will attempt one reconnect.
+      if (_warnedPeers.has(host)) break;
+      _warnedPeers.add(host);
+      ctx.ui.notify(`⚠️ Lost connection to ${host} — attempting reconnect...`, "warning");
+      break;
+    }
+    case "peer_gave_up": {
+      const host = (data?.host as string | undefined) || "unknown";
+      ctx.ui.notify(`❌ Could not reconnect to ${host}. Peer is offline.`, "error");
       break;
     }
     case "error": {
@@ -1043,6 +1061,91 @@ async function sendRpcCommand(
   });
 }
 
+/**
+ * Subscribe to turn_end on a local session socket in the background.
+ * When the event fires, inject the response as a display-only custom message
+ * into the current session via pi.sendMessage (no turn triggered).
+ * The targetSessionId is embedded as sender_info so the message renderer
+ * can show who the reply came from.
+ */
+function subscribeForAsyncReply(
+  pi: ExtensionAPI,
+  socketPath: string,
+  targetSessionId: string,
+  targetSessionName: string | undefined,
+): void {
+  const socket = net.createConnection(socketPath);
+  socket.setEncoding("utf8");
+
+  // 5-minute timeout for async replies — generous but bounded
+  const timeoutHandle = setTimeout(() => {
+    socket.destroy();
+  }, 5 * 60 * 1000);
+
+  let buffer = "";
+
+  socket.once("connect", () => {
+    const subscribeCmd: RpcSubscribeCommand = { type: "subscribe", event: "turn_end" };
+    socket.write(`${JSON.stringify(subscribeCmd)}\n`);
+  });
+
+  socket.on("data", (chunk) => {
+    buffer += chunk;
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex !== -1) {
+      const line = buffer.slice(0, newlineIndex).trim();
+      buffer = buffer.slice(newlineIndex + 1);
+      newlineIndex = buffer.indexOf("\n");
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line) as RpcLocalResponse | RpcEvent;
+        if (msg.type === "event") {
+          const evt = msg as RpcEvent;
+          if (evt.event === "turn_end") {
+            clearTimeout(timeoutHandle);
+            socket.destroy();
+            const data = evt.data as { message?: ExtractedMessage } | undefined;
+            const lastMessage = data?.message;
+            if (lastMessage?.content) {
+              // Tag the reply with the target's identity so the message renderer
+              // shows who replied. The reply content itself may already have
+              // sender_info from the target if they used send_to_session to reply,
+              // but we tag it here as a fallback so it always shows a sender.
+              const alreadyTagged = lastMessage.content.includes("<sender_info>");
+              const tag = alreadyTagged
+                ? ""
+                : `\n\n<sender_info>${JSON.stringify({
+                    sessionId: targetSessionId,
+                    sessionName: targetSessionName || undefined,
+                  })}</sender_info>`;
+              // Inject the reply into the current session as a display-only message
+              pi.sendMessage(
+                {
+                  customType: SESSION_MESSAGE_TYPE,
+                  content: lastMessage.content + tag,
+                  display: true,
+                },
+                { triggerTurn: false },
+              );
+            }
+            return;
+          }
+        }
+      } catch {
+        // keep buffering
+      }
+    }
+  });
+
+  socket.on("error", () => {
+    clearTimeout(timeoutHandle);
+  });
+
+  socket.on("close", () => {
+    clearTimeout(timeoutHandle);
+  });
+}
+
 // Send via daemon relay (for both local and remote sessions)
 async function sendViaRelay(
   targetSessionId: string,
@@ -1083,13 +1186,13 @@ async function sendViaRelay(
   const alive = await isSocketAlive(localSocketPath);
   if (alive) {
     const cmd = rpcCommand as LocalRpcCommand;
-    const timeout = rpcCommand.type === "get_summary" ? 60000 : rpcCommand.type === "send" ? 30000 : 5000;
+    const timeout = rpcCommand.type === "get_summary" ? 60000 : rpcCommand.type === "send" ? 30000 : 15000;
     return sendRpcCommand(localSocketPath, cmd, { timeout });
   }
 
   // Use daemon relay
   const requestId = randomUUID();
-  const timeout = rpcCommand.type === "get_summary" ? 60000 : rpcCommand.type === "send" ? 30000 : 10000;
+  const timeout = rpcCommand.type === "get_summary" ? 60000 : rpcCommand.type === "send" ? 30000 : 20000;
   const daemonResp = await sendDaemonCommand(
     { type: "relay", targetSessionId, rpcCommand, requestId },
     timeout,
@@ -1106,6 +1209,60 @@ async function sendViaRelay(
   }
   const relayData = daemonResp.data as { response?: RpcLocalResponse } | undefined;
   return { response: relayData?.response ?? { type: "response", command: rpcCommand.type, success: true } };
+}
+
+/**
+ * Fire-and-forget send: deliver the message without waiting for the relay,
+ * then subscribe in the background to surface any reply when the target's
+ * turn ends.  Returns immediately once the socket connection attempt resolves.
+ */
+async function sendFireAndForget(
+  pi: ExtensionAPI,
+  targetSessionId: string,
+  targetSessionName: string | undefined,
+  rpcCommand: RpcCommand,
+): Promise<{ delivered: boolean; hasAsyncListener: boolean; error?: string }> {
+  // Only local sockets can be reached without the daemon relay
+  const localSocketPath = getSocketPath(targetSessionId);
+  const alive = await isSocketAlive(localSocketPath);
+
+  if (alive) {
+    // Send the message (wait just for delivery ack, not for turn completion)
+    try {
+      const cmd = rpcCommand as LocalRpcCommand;
+      await sendRpcCommand(localSocketPath, cmd, { timeout: 10000 });
+    } catch (err) {
+      return {
+        delivered: false,
+        hasAsyncListener: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+    // Subscribe in the background to catch the reply
+    subscribeForAsyncReply(pi, localSocketPath, targetSessionId, targetSessionName);
+    return { delivered: true, hasAsyncListener: true };
+  }
+
+  // Remote session — fire-and-forget via daemon relay.
+  // We write the relay command to the daemon socket and close immediately,
+  // without waiting for any response. The daemon will forward the message
+  // to the remote peer asynchronously.
+  if (!fs.existsSync(DAEMON_SOCK)) {
+    return { delivered: false, hasAsyncListener: false, error: "Session not reachable (no local socket, daemon not running)" };
+  }
+  const requestId = randomUUID();
+  const delivered = await new Promise<boolean>((resolve) => {
+    const sock = net.createConnection(DAEMON_SOCK);
+    const timer = setTimeout(() => { sock.destroy(); resolve(false); }, 5000);
+    sock.once("connect", () => {
+      sock.write(JSON.stringify({ type: "relay", targetSessionId, rpcCommand, requestId, fireAndForget: true } satisfies DaemonRelayRequest) + "\n");
+      clearTimeout(timer);
+      sock.end(); // close immediately — don't wait for a response
+      resolve(true);
+    });
+    sock.once("error", () => { clearTimeout(timer); resolve(false); });
+  });
+  return { delivered, hasAsyncListener: false };
 }
 
 
@@ -1573,7 +1730,7 @@ Messages automatically include sender session info for replies. When you want a 
       ),
       wait_until: Type.Optional(
         StringEnum(["turn_end", "message_processed"] as const, {
-          description: "Wait behavior for send action",
+          description: "Wait behavior for send action. Omit to use the default fire-and-forget behavior (send and show reply when it arrives).",
         }),
       ),
     }),
@@ -1712,6 +1869,7 @@ Messages automatically include sender session info for replies. When you want a 
           ? `\n\n<sender_info>${JSON.stringify({
               sessionId: senderSessionId,
               sessionName: senderSessionName || undefined,
+              hostname: os.hostname(),
             })}</sender_info>`
           : "";
 
@@ -1744,7 +1902,7 @@ Messages automatically include sender session info for replies. When you want a 
         }
 
         if (params.wait_until === "message_processed") {
-          // Fire-and-forget: do not await, return immediately
+          // Explicit immediate return with no subscription
           void sendViaRelay(targetSessionId, sendCommand);
           return {
             content: [{ type: "text", text: `Message queued for session ${displayTarget || targetSessionId}` }],
@@ -1752,18 +1910,24 @@ Messages automatically include sender session info for replies. When you want a 
           };
         }
 
-        const result = await sendViaRelay(targetSessionId, sendCommand);
-        if (!result.response.success) {
+        // Default: fire-and-forget with background reply listener.
+        // Send the message and return immediately; if the target session
+        // responds, the reply is injected into this session when it arrives.
+        const ffResult = await sendFireAndForget(pi, targetSessionId, sessionName, sendCommand);
+        if (!ffResult.delivered) {
           return {
-            content: [{ type: "text", text: `Failed: ${result.response.error ?? "unknown error"}` }],
+            content: [{ type: "text", text: `Failed to send: ${ffResult.error ?? "unknown error"}` }],
             isError: true,
-            details: result,
+            details: { error: ffResult.error },
           };
         }
 
+        const replyHint = ffResult.hasAsyncListener
+          ? " Reply will appear here when received."
+          : "";
         return {
-          content: [{ type: "text", text: `Message sent to session ${displayTarget || targetSessionId}` }],
-          details: result.response.data,
+          content: [{ type: "text", text: `Message sent to ${displayTarget || targetSessionId}.${replyHint}` }],
+          details: { delivered: true, hasAsyncListener: ffResult.hasAsyncListener },
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
@@ -1895,10 +2059,12 @@ Messages automatically include sender session info for replies. When you want a 
       }
 
       if (details && "delivered" in details) {
-        const mode = details.mode as string | undefined;
+        const hasAsyncListener = details.hasAsyncListener as boolean | undefined;
         const icon = theme.fg("success", "✓");
-        let text = `${icon}${theme.fg("muted", " Message delivered")}`;
-        if (mode) text += theme.fg("dim", ` (${mode})`);
+        let text = `${icon}${theme.fg("muted", " Message sent")}`;
+        if (hasAsyncListener) {
+          text += theme.fg("dim", " · listening for reply");
+        }
         return new Text(text, 0, 0);
       }
 

@@ -102,6 +102,7 @@ export interface DaemonRelayRequest {
   targetSessionId: string;
   rpcCommand: RpcCommand;
   requestId: string;
+  fireAndForget?: boolean;
 }
 
 export interface DaemonSubscribeRequest {

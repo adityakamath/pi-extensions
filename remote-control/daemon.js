@@ -3,6 +3,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { exec } from "node:child_process";
+import { logAudit } from "./audit-log.js";
+import { checkRateLimit } from "./rate-limit.js";
+import { checkMaxMsgSize, MAX_MSG_BYTES } from "./max-size.js";
 import {
   CONTROL_DIR,
   DAEMON_SOCK,
@@ -38,11 +41,9 @@ let tcpServer = null;
 let daemonServer = null;
 let fsWatcher = null;
 function resetAutoShutdown() {
-  if (autoShutdownTimer)
-    clearTimeout(autoShutdownTimer);
+  if (autoShutdownTimer) clearTimeout(autoShutdownTimer);
   const timeoutMs = config.autoShutdownTimeout * 1e3;
-  if (timeoutMs <= 0)
-    return;
+  if (timeoutMs <= 0) return;
   autoShutdownTimer = setTimeout(() => {
     const noLocal = localSessions.size === 0;
     const noPeers = remotePeers.size === 0 || [...remotePeers.values()].every((p) => !p.connected);
@@ -58,10 +59,8 @@ function resetAutoShutdown() {
 }
 function cleanup() {
   log("Cleaning up...");
-  if (heartbeatTimer)
-    clearInterval(heartbeatTimer);
-  if (autoShutdownTimer)
-    clearTimeout(autoShutdownTimer);
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  if (autoShutdownTimer) clearTimeout(autoShutdownTimer);
   if (fsWatcher) {
     try {
       fsWatcher.close();
@@ -69,8 +68,7 @@ function cleanup() {
     }
   }
   for (const peer of remotePeers.values()) {
-    if (peer.reconnectTimer)
-      clearTimeout(peer.reconnectTimer);
+    if (peer.reconnectTimer) clearTimeout(peer.reconnectTimer);
     if (peer.socket) {
       try {
         peer.socket.destroy();
@@ -164,10 +162,8 @@ async function verifySocketAlive(socketPath, timeoutMs = 300) {
 async function addLocalSession(sockFile) {
   const base = path.basename(sockFile, SOCKET_SUFFIX);
   const sessionId = base;
-  if (!isSafeSessionId(sessionId))
-    return;
-  if (localSessions.has(sessionId))
-    return;
+  if (!isSafeSessionId(sessionId)) return;
+  if (localSessions.has(sessionId)) return;
   const socketPath = path.join(CONTROL_DIR, sockFile);
   const alive = await verifySocketAlive(socketPath);
   if (!alive) {
@@ -190,8 +186,7 @@ async function addLocalSession(sockFile) {
 }
 function removeLocalSession(sessionId) {
   const entry = localSessions.get(sessionId);
-  if (!entry)
-    return;
+  if (!entry) return;
   localSessions.delete(sessionId);
   removeSessionName(sessionId);
   log(`Local session removed: ${sessionId}`);
@@ -214,12 +209,9 @@ async function scanLocalSessions() {
 function startFsWatch() {
   try {
     fsWatcher = fs.watch(CONTROL_DIR, async (eventType, filename) => {
-      if (!filename)
-        return;
-      if (!filename.endsWith(SOCKET_SUFFIX))
-        return;
-      if (filename === path.basename(DAEMON_SOCK))
-        return;
+      if (!filename) return;
+      if (!filename.endsWith(SOCKET_SUFFIX)) return;
+      if (filename === path.basename(DAEMON_SOCK)) return;
       const sockFile = filename;
       const socketPath = path.join(CONTROL_DIR, sockFile);
       const sessionId = path.basename(sockFile, SOCKET_SUFFIX);
@@ -375,8 +367,7 @@ function setupPeerSocket(peer, socket) {
     buffer = lines.pop() ?? "";
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed)
-        continue;
+      if (!trimmed) continue;
       try {
         const msg = JSON.parse(trimmed);
         if (msg.type === "hello" && !peer.connected) {
@@ -416,17 +407,21 @@ function setupPeerSocket(peer, socket) {
   });
 }
 function scheduleReconnect(peer) {
-  if (peer.removed)
+  if (peer.removed || peer.gaveUp) return;
+  if (peer.reconnectAttempts >= 1) {
+    peer.gaveUp = true;
+    log(`Peer ${peer.host} reconnect failed. Giving up.`);
+    pushEvent({ type: "event", event: "peer_gave_up", data: { host: peer.host } });
     return;
-  const delay = Math.min(1e3 * Math.pow(2, peer.reconnectAttempts), 6e4);
+  }
   peer.reconnectAttempts++;
-  log(`Reconnecting to ${peer.host}:${peer.port} in ${delay}ms (attempt ${peer.reconnectAttempts}).`);
+  log(`Reconnecting to ${peer.host}:${peer.port} (attempt ${peer.reconnectAttempts}).`);
   peer.reconnectTimer = setTimeout(() => {
     peer.reconnectTimer = null;
-    if (!peer.removed) {
+    if (!peer.removed && !peer.gaveUp) {
       connectToPeer(peer.host, peer.port, peer);
     }
-  }, delay);
+  }, 3e3);
 }
 function connectToPeer(host, port, existingPeer) {
   let peer = existingPeer ?? remotePeers.get(host);
@@ -440,7 +435,8 @@ function connectToPeer(host, port, existingPeer) {
       connected: false,
       reconnectTimer: null,
       reconnectAttempts: 0,
-      removed: false
+      removed: false,
+      gaveUp: false
     };
     remotePeers.set(host, peer);
   }
@@ -463,8 +459,7 @@ function startHeartbeat() {
     const heartbeatMsg = JSON.stringify({ type: "heartbeat" }) + "\n";
     const now = Date.now();
     for (const peer of remotePeers.values()) {
-      if (!peer.connected || !peer.socket)
-        continue;
+      if (!peer.connected || !peer.socket) continue;
       if (now - peer.lastSeen > deadThreshold) {
         log(`Peer ${peer.host} timed out (no message for ${deadThreshold}ms). Closing.`);
         peer.socket.destroy();
@@ -482,7 +477,7 @@ function getRelayTimeout(command) {
   switch (command.type) {
     case "get_message":
     case "clear":
-      return 5e3;
+      return 15e3;
     case "get_summary":
       return 6e4;
     case "send":
@@ -513,8 +508,7 @@ async function relayToLocalSocket(socketPath, rpcCommand, timeoutMs) {
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed)
-          continue;
+        if (!trimmed) continue;
         if (!done) {
           done = true;
           clearTimeout(timer);
@@ -659,6 +653,7 @@ async function handleDaemonCommand(socket, req) {
         });
       }
       for (const peer of remotePeers.values()) {
+        if (!peer.connected) continue;
         for (const session of peer.sessions.values()) {
           sessions.push({
             ...session,
@@ -691,27 +686,77 @@ async function handleDaemonCommand(socket, req) {
       break;
     }
     case "relay": {
+      const ratePeer = socket.remoteAddress || "local";
+      if (!checkRateLimit(ratePeer)) {
+        sendDaemonResponse(socket, "relay", false, void 0, "Rate limit exceeded");
+        logAudit({
+          timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+          peer: ratePeer,
+          action: "relay",
+          result: "fail",
+          error: "Rate limit exceeded"
+        });
+        return;
+      }
       const { targetSessionId, rpcCommand, requestId } = req;
+      const fireAndForget = req.fireAndForget === true;
       const localEntry = localSessions.get(targetSessionId);
       if (localEntry) {
-        const timeout2 = getRelayTimeout(rpcCommand);
-        try {
-          const response = await relayToLocalSocket(localEntry.socketPath, rpcCommand, timeout2);
-          sendDaemonResponse(socket, "relay", true, { requestId, response });
-        } catch (err) {
-          sendDaemonResponse(socket, "relay", false, void 0, String(err));
+        if (fireAndForget) {
+          sendDaemonResponse(socket, "relay", true, { requestId, queued: true });
+          const timeout2 = getRelayTimeout(rpcCommand);
+          relayToLocalSocket(localEntry.socketPath, rpcCommand, timeout2).catch((err) => {
+            log(`Fire-and-forget local relay failed for ${targetSessionId}: ${err}`);
+          });
+        } else {
+          const timeout2 = getRelayTimeout(rpcCommand);
+          try {
+            const response = await relayToLocalSocket(localEntry.socketPath, rpcCommand, timeout2);
+            sendDaemonResponse(socket, "relay", true, { requestId, response });
+          } catch (err) {
+            sendDaemonResponse(socket, "relay", false, void 0, String(err));
+          }
         }
         return;
       }
       let targetPeer = null;
+      let sessionFoundButDisconnected = false;
       for (const peer of remotePeers.values()) {
-        if (peer.sessions.has(targetSessionId) && peer.connected) {
-          targetPeer = peer;
+        if (peer.sessions.has(targetSessionId)) {
+          if (peer.connected) {
+            targetPeer = peer;
+          } else {
+            sessionFoundButDisconnected = true;
+          }
           break;
         }
       }
       if (!targetPeer || !targetPeer.socket) {
-        sendDaemonResponse(socket, "relay", false, void 0, `Session ${targetSessionId} not found`);
+        const error = sessionFoundButDisconnected ? `Session ${targetSessionId} is on a disconnected peer` : `Session ${targetSessionId} not found`;
+        sendDaemonResponse(socket, "relay", false, void 0, error);
+        return;
+      }
+      const peerRpc = {
+        type: "rpc",
+        targetSessionId,
+        requestId,
+        command: rpcCommand
+      };
+      if (fireAndForget) {
+        try {
+          targetPeer.socket.write(JSON.stringify(peerRpc) + "\n");
+          sendDaemonResponse(socket, "relay", true, { requestId, queued: true });
+        } catch (err) {
+          sendDaemonResponse(socket, "relay", false, void 0, String(err));
+          logAudit({
+            timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+            peer: socket.remoteAddress || "local",
+            action: `${rpcCommand?.type || "relay"}`,
+            data: JSON.stringify({ targetSessionId }),
+            result: "fail",
+            error: String(err)
+          });
+        }
         return;
       }
       const timeout = getRelayTimeout(rpcCommand);
@@ -722,18 +767,28 @@ async function handleDaemonCommand(socket, req) {
         }, timeout);
         pendingRelays.set(requestId, { resolve, timer });
       });
-      const peerRpc = {
-        type: "rpc",
-        targetSessionId,
-        requestId,
-        command: rpcCommand
-      };
       try {
         targetPeer.socket.write(JSON.stringify(peerRpc) + "\n");
         const response = await responsePromise;
         sendDaemonResponse(socket, "relay", true, { requestId, response });
+        logAudit({
+          timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+          peer: socket.remoteAddress || "local",
+          action: `${rpcCommand?.type || "relay"}`,
+          data: JSON.stringify({ targetSessionId }),
+          result: response?.success ? "ok" : "fail",
+          error: response?.success ? void 0 : response?.error || void 0
+        });
       } catch (err) {
         sendDaemonResponse(socket, "relay", false, void 0, String(err));
+        logAudit({
+          timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+          peer: socket.remoteAddress || "local",
+          action: `${rpcCommand?.type || "relay"}`,
+          data: JSON.stringify({ targetSessionId }),
+          result: "fail",
+          error: String(err)
+        });
       }
       break;
     }
@@ -774,13 +829,28 @@ function startDaemonServer() {
     let buffer = "";
     socket.setEncoding("utf8");
     socket.on("data", (chunk) => {
+      if (!checkMaxMsgSize(chunk)) {
+        try {
+          socket.write(JSON.stringify({ type: "error", error: `Message size exceeds ${MAX_MSG_BYTES} bytes` }) + "\n");
+        } catch {
+        }
+        socket.destroy();
+        return;
+      }
       buffer += chunk;
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed)
-          continue;
+        if (!trimmed) continue;
+        if (!checkMaxMsgSize(trimmed)) {
+          try {
+            socket.write(JSON.stringify({ type: "error", error: `Message size exceeds ${MAX_MSG_BYTES} bytes` }) + "\n");
+          } catch {
+          }
+          socket.destroy();
+          return;
+        }
         try {
           const req = JSON.parse(trimmed);
           handleDaemonCommand(socket, req).catch((err) => {
@@ -806,6 +876,11 @@ function startDaemonServer() {
   });
   daemonServer.listen(DAEMON_SOCK, () => {
     log(`Daemon control socket listening at ${DAEMON_SOCK}`);
+    try {
+      fs.chmodSync(DAEMON_SOCK, 384);
+    } catch (e) {
+      logError("Failed to chmod daemon.sock", e);
+    }
   });
 }
 function startTcpServer() {
@@ -818,13 +893,28 @@ function startTcpServer() {
     socket.setEncoding("utf8");
     socket.setKeepAlive(true, 1e4);
     socket.on("data", (chunk) => {
+      if (!checkMaxMsgSize(chunk)) {
+        try {
+          socket.write(JSON.stringify({ type: "error", error: `Message size exceeds ${MAX_MSG_BYTES} bytes` }) + "\n");
+        } catch {
+        }
+        socket.destroy();
+        return;
+      }
       buffer += chunk;
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed)
-          continue;
+        if (!trimmed) continue;
+        if (!checkMaxMsgSize(trimmed)) {
+          try {
+            socket.write(JSON.stringify({ type: "error", error: `Message size exceeds ${MAX_MSG_BYTES} bytes` }) + "\n");
+          } catch {
+          }
+          socket.destroy();
+          return;
+        }
         try {
           const msg = JSON.parse(trimmed);
           if (!helloDone) {
@@ -850,7 +940,8 @@ function startTcpServer() {
               connected: true,
               reconnectTimer: null,
               reconnectAttempts: 0,
-              removed: false
+              removed: false,
+              gaveUp: false
             };
             remotePeers.set(remoteHost, peer);
             handlePeerMessage(peer, msg);
@@ -939,3 +1030,6 @@ if (isMain) {
     process.exit(1);
   });
 }
+export {
+  remotePeers
+};
